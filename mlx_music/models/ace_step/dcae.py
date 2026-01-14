@@ -47,7 +47,7 @@ class DCAEConfig:
 
 
 class RMSNorm2d(nn.Module):
-    """RMS Normalization for 2D feature maps."""
+    """RMS Normalization for 2D feature maps (NHWC format)."""
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -55,11 +55,11 @@ class RMSNorm2d(nn.Module):
         self.weight = mx.ones((dim,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: (batch, channels, height, width)
-        # Normalize over channel dimension
-        rms = mx.sqrt(mx.mean(x**2, axis=1, keepdims=True) + self.eps)
+        # x: (batch, height, width, channels) - NHWC format
+        # Normalize over channel dimension (last axis)
+        rms = mx.sqrt(mx.mean(x**2, axis=-1, keepdims=True) + self.eps)
         x = x / rms
-        return x * self.weight[None, :, None, None]
+        return x * self.weight[None, None, None, :]
 
 
 class ResBlock2d(nn.Module):
@@ -139,34 +139,30 @@ class EfficientViTBlock(nn.Module):
         self.pool_size = qkv_multiscale
 
     def __call__(self, x: mx.array) -> mx.array:
+        # x: (batch, height, width, channels) - NHWC format
         residual = x
-        batch, channels, height, width = x.shape
+        batch, height, width, channels = x.shape
 
         x = self.norm(x)
 
-        # QKV projection
-        qkv = self.qkv(x)  # (B, 3*C, H, W)
-        qkv = qkv.reshape(batch, 3, self.num_heads, self.head_dim, height, width)
+        # QKV projection (Conv2d in MLX expects NHWC)
+        qkv = self.qkv(x)  # (B, H, W, 3*C)
+
+        # Reshape: (B, H, W, 3*C) -> (B, H*W, 3, num_heads, head_dim)
+        qkv = qkv.reshape(batch, height * width, 3, self.num_heads, self.head_dim)
+        # Transpose to (B, 3, num_heads, H*W, head_dim)
+        qkv = mx.transpose(qkv, axes=(0, 2, 3, 1, 4))
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
-        # Reshape for attention: (B, heads, H*W, head_dim)
-        q = q.reshape(batch, self.num_heads, self.head_dim, -1)
-        q = mx.transpose(q, axes=(0, 1, 3, 2))  # (B, heads, H*W, head_dim)
-
-        k = k.reshape(batch, self.num_heads, self.head_dim, -1)
-        k = mx.transpose(k, axes=(0, 1, 3, 2))
-
-        v = v.reshape(batch, self.num_heads, self.head_dim, -1)
-        v = mx.transpose(v, axes=(0, 1, 3, 2))
-
         # Scaled dot-product attention
+        # q, k, v: (B, heads, H*W, head_dim)
         attn = mx.matmul(q, mx.transpose(k, axes=(0, 1, 3, 2))) * self.scale
         attn = mx.softmax(attn, axis=-1)
         out = mx.matmul(attn, v)
 
-        # Reshape back: (B, heads, H*W, head_dim) → (B, C, H, W)
-        out = mx.transpose(out, axes=(0, 1, 3, 2))  # (B, heads, head_dim, H*W)
-        out = out.reshape(batch, channels, height, width)
+        # Reshape back: (B, heads, H*W, head_dim) → (B, H, W, C)
+        out = mx.transpose(out, axes=(0, 2, 1, 3))  # (B, H*W, heads, head_dim)
+        out = out.reshape(batch, height, width, channels)
 
         out = self.proj(out)
 
@@ -185,17 +181,17 @@ class Downsample2d(nn.Module):
 
 
 class Upsample2d(nn.Module):
-    """2x upsampling with interpolation and convolution."""
+    """2x upsampling with interpolation and convolution (NHWC format)."""
 
     def __init__(self, channels: int):
         super().__init__()
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Bilinear upsampling 2x
-        batch, channels, height, width = x.shape
-        x = mx.repeat(x, 2, axis=2)
-        x = mx.repeat(x, 2, axis=3)
+        # x: (batch, height, width, channels) - NHWC format
+        # Nearest neighbor upsampling 2x
+        x = mx.repeat(x, 2, axis=1)  # height
+        x = mx.repeat(x, 2, axis=2)  # width
         return self.conv(x)
 
 
@@ -349,12 +345,18 @@ class DCAE(nn.Module):
         Encode mel-spectrogram to latent.
 
         Args:
-            mel: Normalized mel-spectrogram (batch, 2, 128, time)
+            mel: Normalized mel-spectrogram (batch, 2, 128, time) in NCHW format
 
         Returns:
-            Latent (batch, 8, H, W)
+            Latent (batch, 8, H, W) in NCHW format
         """
+        # Convert NCHW to NHWC for MLX convolutions
+        mel = mx.transpose(mel, axes=(0, 2, 3, 1))  # (B, H, W, C)
+
         latent = self.encoder(mel)
+
+        # Convert back to NCHW
+        latent = mx.transpose(latent, axes=(0, 3, 1, 2))  # (B, C, H, W)
 
         # Apply scaling
         latent = (latent - self.config.shift_factor) * self.config.scale_factor
@@ -366,15 +368,21 @@ class DCAE(nn.Module):
         Decode latent to mel-spectrogram.
 
         Args:
-            latent: Scaled latent (batch, 8, H, W)
+            latent: Scaled latent (batch, 8, H, W) in NCHW format
 
         Returns:
-            Mel-spectrogram (batch, 2, 128, time)
+            Mel-spectrogram (batch, 2, 128, time) in NCHW format
         """
         # Unscale latent
         latent = latent / self.config.scale_factor + self.config.shift_factor
 
+        # Convert NCHW to NHWC for MLX convolutions
+        latent = mx.transpose(latent, axes=(0, 2, 3, 1))  # (B, H, W, C)
+
         mel = self.decoder(latent)
+
+        # Convert back to NCHW
+        mel = mx.transpose(mel, axes=(0, 3, 1, 2))  # (B, C, H, W)
 
         return mel
 

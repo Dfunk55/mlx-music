@@ -51,7 +51,7 @@ class VocoderConfig:
 
 
 class LayerNorm1d(nn.Module):
-    """Layer normalization for 1D sequences (channels last format)."""
+    """Layer normalization for 1D sequences (NLC format: batch, time, channels)."""
 
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -60,11 +60,12 @@ class LayerNorm1d(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: (batch, channels, time) → normalize over channels
-        mean = mx.mean(x, axis=1, keepdims=True)
-        var = mx.var(x, axis=1, keepdims=True)
+        # x: (batch, time, channels) - NLC format
+        # Normalize over channel dimension (last axis)
+        mean = mx.mean(x, axis=-1, keepdims=True)
+        var = mx.var(x, axis=-1, keepdims=True)
         x = (x - mean) / mx.sqrt(var + self.eps)
-        return x * self.weight[None, :, None] + self.bias[None, :, None]
+        return x * self.weight[None, None, :] + self.bias[None, None, :]
 
 
 class ConvNeXtBlock(nn.Module):
@@ -91,27 +92,21 @@ class ConvNeXtBlock(nn.Module):
         self.gamma = mx.ones((dim,)) * 1e-6
 
     def __call__(self, x: mx.array) -> mx.array:
+        # x: (batch, time, channels) - NLC format
         residual = x
 
-        # Depthwise conv
+        # Depthwise conv (MLX Conv1d expects NLC)
         x = self.dwconv(x)
 
-        # Transpose for linear: (B, C, T) → (B, T, C)
-        x = mx.transpose(x, axes=(0, 2, 1))
-
-        # Norm and MLP
-        x = self.norm(mx.transpose(x, axes=(0, 2, 1)))
-        x = mx.transpose(x, axes=(0, 2, 1))
+        # Norm and MLP (already in NLC format)
+        x = self.norm(x)
 
         x = self.pwconv1(x)
-        x = mx.gelu(x)
+        x = nn.gelu(x)
         x = self.pwconv2(x)
 
         # Layer scale
         x = x * self.gamma[None, None, :]
-
-        # Transpose back: (B, T, C) → (B, C, T)
-        x = mx.transpose(x, axes=(0, 2, 1))
 
         return x + residual
 
@@ -270,11 +265,11 @@ class HiFiGANGenerator(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.conv_pre(x)
-        x = mx.leaky_relu(x, negative_slope=0.1)
+        x = nn.leaky_relu(x, negative_slope=0.1)
 
         for i, (up, resblock_group) in enumerate(zip(self.ups, self.resblocks)):
             x = up(x)
-            x = mx.leaky_relu(x, negative_slope=0.1)
+            x = nn.leaky_relu(x, negative_slope=0.1)
 
             # Apply all residual blocks and average
             xs = None
@@ -285,7 +280,7 @@ class HiFiGANGenerator(nn.Module):
                     xs = xs + resblock(x)
             x = xs / len(resblock_group)
 
-        x = mx.leaky_relu(x, negative_slope=0.1)
+        x = nn.leaky_relu(x, negative_slope=0.1)
         x = self.conv_post(x)
         x = mx.tanh(x)
 
@@ -310,16 +305,22 @@ class HiFiGANVocoder(nn.Module):
         Convert mel-spectrogram to audio.
 
         Args:
-            mel: Log-mel spectrogram (batch, n_mels, time)
+            mel: Log-mel spectrogram (batch, n_mels, time) in NCL format
 
         Returns:
-            Audio waveform (batch, 1, samples)
+            Audio waveform (batch, 1, samples) in NCL format
         """
-        # Backbone: mel → features
+        # Convert NCL to NLC for MLX Conv1d
+        mel = mx.transpose(mel, axes=(0, 2, 1))  # (B, T, C)
+
+        # Backbone: mel → features (in NLC format)
         features = self.backbone(mel)
 
-        # Generator: features → audio
+        # Generator: features → audio (in NLC format)
         audio = self.generator(features)
+
+        # Convert back to NCL format
+        audio = mx.transpose(audio, axes=(0, 2, 1))  # (B, C, T)
 
         return audio
 
