@@ -7,6 +7,7 @@ to avoid redundant computation. Following mlx-audio patterns for efficiency.
 
 import math
 import threading
+from collections import OrderedDict
 from functools import lru_cache
 from typing import Optional, Literal
 
@@ -41,7 +42,7 @@ _EPSILON = 1e-8
 # =============================================================================
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=128)
 def hanning(size: int, periodic: bool = False) -> mx.array:
     """
     Hanning (Hann) window with caching.
@@ -65,7 +66,7 @@ def hanning(size: int, periodic: bool = False) -> mx.array:
     )
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=128)
 def hamming(size: int, periodic: bool = False) -> mx.array:
     """
     Hamming window with caching.
@@ -89,7 +90,7 @@ def hamming(size: int, periodic: bool = False) -> mx.array:
     )
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=128)
 def blackman(size: int, periodic: bool = False) -> mx.array:
     """
     Blackman window with caching.
@@ -118,7 +119,7 @@ def blackman(size: int, periodic: bool = False) -> mx.array:
     )
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=128)
 def bartlett(size: int, periodic: bool = False) -> mx.array:
     """
     Bartlett (triangular) window with caching.
@@ -275,33 +276,21 @@ def mel_to_hz(mels: float, scale: Literal["htk", "slaney"] = "htk") -> float:
 
 
 @lru_cache(maxsize=32)
-def mel_filterbank(
-    n_mels: int = 128,
-    n_fft: int = 2048,
-    sample_rate: int = 44100,
-    f_min: float = 0.0,
-    f_max: Optional[float] = None,
-    norm: Optional[Literal["slaney"]] = None,
-    mel_scale: Literal["htk", "slaney"] = "htk",
+def _mel_filterbank_cached(
+    n_mels: int,
+    n_fft: int,
+    sample_rate: int,
+    f_min: float,
+    f_max: float,  # Concrete value, not Optional
+    norm: Optional[Literal["slaney"]],
+    mel_scale: Literal["htk", "slaney"],
 ) -> mx.array:
     """
-    Create a mel filterbank matrix with caching.
+    Internal cached implementation with concrete parameters.
 
-    Args:
-        n_mels: Number of mel bands
-        n_fft: FFT size
-        sample_rate: Audio sample rate
-        f_min: Minimum frequency
-        f_max: Maximum frequency (default: sample_rate / 2)
-        norm: Normalization mode ("slaney" or None)
-        mel_scale: Mel scale formula ("htk" or "slaney")
-
-    Returns:
-        Filterbank matrix of shape (n_mels, n_fft // 2 + 1)
+    All Optional parameters must be resolved before calling this function
+    to ensure correct cache behavior.
     """
-    if f_max is None:
-        f_max = sample_rate / 2.0
-
     n_freqs = n_fft // 2 + 1
     all_freqs = np.linspace(0, sample_rate / 2, n_freqs)
 
@@ -333,6 +322,39 @@ def mel_filterbank(
     return mx.array(filterbank, dtype=mx.float32)
 
 
+def mel_filterbank(
+    n_mels: int = 128,
+    n_fft: int = 2048,
+    sample_rate: int = 44100,
+    f_min: float = 0.0,
+    f_max: Optional[float] = None,
+    norm: Optional[Literal["slaney"]] = None,
+    mel_scale: Literal["htk", "slaney"] = "htk",
+) -> mx.array:
+    """
+    Create a mel filterbank matrix with caching.
+
+    Args:
+        n_mels: Number of mel bands
+        n_fft: FFT size
+        sample_rate: Audio sample rate
+        f_min: Minimum frequency
+        f_max: Maximum frequency (default: sample_rate / 2)
+        norm: Normalization mode ("slaney" or None)
+        mel_scale: Mel scale formula ("htk" or "slaney")
+
+    Returns:
+        Filterbank matrix of shape (n_mels, n_fft // 2 + 1)
+    """
+    # Resolve default value to ensure correct cache key
+    if f_max is None:
+        f_max = sample_rate / 2.0
+
+    return _mel_filterbank_cached(
+        n_mels, n_fft, sample_rate, f_min, f_max, norm, mel_scale
+    )
+
+
 # =============================================================================
 # ISTFT Cache (for efficient overlap-add)
 # =============================================================================
@@ -340,19 +362,41 @@ def mel_filterbank(
 
 class ISTFTCache:
     """
-    Thread-safe caching for iSTFT operations.
+    Thread-safe LRU caching for iSTFT operations.
 
     Caches normalization buffers and position indices for efficient
-    vectorized overlap-add reconstruction.
+    vectorized overlap-add reconstruction. Uses bounded LRU caching
+    to prevent unbounded memory growth.
 
     Note: Uses structural keys (shape, n_fft, hop_length) rather than
     content hashing to avoid hash collision issues.
     """
 
-    def __init__(self):
-        self.norm_buffer_cache = {}
-        self.position_cache = {}
+    # Default maximum cache sizes (can be overridden in constructor)
+    DEFAULT_NORM_BUFFER_MAXSIZE = 64
+    DEFAULT_POSITION_MAXSIZE = 128
+
+    def __init__(
+        self,
+        norm_buffer_maxsize: int = DEFAULT_NORM_BUFFER_MAXSIZE,
+        position_maxsize: int = DEFAULT_POSITION_MAXSIZE,
+    ):
+        """Initialize cache with optional size limits.
+
+        Args:
+            norm_buffer_maxsize: Max number of norm buffers to cache (default: 64)
+            position_maxsize: Max number of position arrays to cache (default: 128)
+        """
+        self.norm_buffer_maxsize = norm_buffer_maxsize
+        self.position_maxsize = position_maxsize
+        self.norm_buffer_cache: OrderedDict = OrderedDict()
+        self.position_cache: OrderedDict = OrderedDict()
         self._lock = threading.Lock()
+
+    def _evict_oldest(self, cache: OrderedDict, maxsize: int) -> None:
+        """Evict oldest items if cache exceeds maxsize."""
+        while len(cache) >= maxsize:
+            cache.popitem(last=False)  # Remove oldest (FIFO)
 
     def get_positions(
         self,
@@ -364,14 +408,23 @@ class ISTFTCache:
         key = (num_frames, frame_length, hop_length)
 
         with self._lock:
-            if key not in self.position_cache:
-                positions = (
-                    mx.arange(num_frames)[:, None] * hop_length
-                    + mx.arange(frame_length)[None, :]
-                )
-                self.position_cache[key] = positions.reshape(-1)
+            if key in self.position_cache:
+                # Move to end (mark as recently used)
+                self.position_cache.move_to_end(key)
+                return self.position_cache[key]
 
-            return self.position_cache[key]
+            # Compute new positions
+            positions = (
+                mx.arange(num_frames)[:, None] * hop_length
+                + mx.arange(frame_length)[None, :]
+            )
+            positions_flat = positions.reshape(-1)
+
+            # Evict oldest if needed and store
+            self._evict_oldest(self.position_cache, self.position_maxsize)
+            self.position_cache[key] = positions_flat
+
+            return positions_flat
 
     def get_norm_buffer(
         self,
@@ -392,20 +445,34 @@ class ISTFTCache:
         key = (n_fft, hop_length, window_shape, num_frames)
 
         with self._lock:
-            if key not in self.norm_buffer_cache:
-                frame_length = window.shape[0]
-                ola_len = (num_frames - 1) * hop_length + frame_length
+            if key in self.norm_buffer_cache:
+                # Move to end (mark as recently used)
+                self.norm_buffer_cache.move_to_end(key)
+                return self.norm_buffer_cache[key]
+
+            # Compute new norm buffer
+            frame_length = window.shape[0]
+            ola_len = (num_frames - 1) * hop_length + frame_length
+
+            # Get positions (this will use its own cache)
+            # Release lock temporarily to avoid deadlock
+            self._lock.release()
+            try:
                 positions_flat = self.get_positions(num_frames, frame_length, hop_length)
+            finally:
+                self._lock.acquire()
 
-                window_squared = window**2
-                norm_buffer = mx.zeros(ola_len, dtype=mx.float32)
-                window_sq_tiled = mx.tile(window_squared, (num_frames,))
-                norm_buffer = norm_buffer.at[positions_flat].add(window_sq_tiled)
-                norm_buffer = mx.maximum(norm_buffer, _EPSILON)
+            window_squared = window**2
+            norm_buffer = mx.zeros(ola_len, dtype=mx.float32)
+            window_sq_tiled = mx.tile(window_squared, (num_frames,))
+            norm_buffer = norm_buffer.at[positions_flat].add(window_sq_tiled)
+            norm_buffer = mx.maximum(norm_buffer, _EPSILON)
 
-                self.norm_buffer_cache[key] = norm_buffer
+            # Evict oldest if needed and store
+            self._evict_oldest(self.norm_buffer_cache, self.norm_buffer_maxsize)
+            self.norm_buffer_cache[key] = norm_buffer
 
-            return self.norm_buffer_cache[key]
+            return norm_buffer
 
     def clear(self):
         """Clear all cached data to free memory."""
@@ -418,7 +485,9 @@ class ISTFTCache:
         with self._lock:
             return {
                 "norm_buffers": len(self.norm_buffer_cache),
+                "norm_buffer_maxsize": self.norm_buffer_maxsize,
                 "position_indices": len(self.position_cache),
+                "position_maxsize": self.position_maxsize,
                 "total_cached_items": (
                     len(self.norm_buffer_cache) + len(self.position_cache)
                 ),
@@ -446,7 +515,7 @@ def clear_dsp_cache():
     blackman.cache_clear()
     bartlett.cache_clear()
     get_stft_window.cache_clear()
-    mel_filterbank.cache_clear()
+    _mel_filterbank_cached.cache_clear()
     _istft_cache.clear()
 
 
@@ -458,6 +527,6 @@ def dsp_cache_info() -> dict:
         "blackman": blackman.cache_info()._asdict(),
         "bartlett": bartlett.cache_info()._asdict(),
         "stft_window": get_stft_window.cache_info()._asdict(),
-        "mel_filterbank": mel_filterbank.cache_info()._asdict(),
+        "mel_filterbank": _mel_filterbank_cached.cache_info()._asdict(),
         "istft_cache": _istft_cache.info(),
     }

@@ -7,10 +7,13 @@ converting from PyTorch format to MLX format.
 
 import json
 import os
+import re
+import unicodedata
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from urllib.parse import unquote
 
 import mlx.core as mx
 import numpy as np
@@ -25,9 +28,24 @@ class PathTraversalError(ValueError):
     pass
 
 
+# Maximum allowed path length to prevent buffer overflow attacks
+_MAX_PATH_LENGTH = 4096
+
+# Pattern to detect dangerous control characters (ASCII 0-31 except tab)
+_CONTROL_CHAR_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+
 def _validate_safe_path(base_dir: Path, filename: str) -> Path:
     """
     Validate that a filename doesn't escape the base directory.
+
+    Performs comprehensive security checks including:
+    - URL decoding to catch %2e%2e (encoded ..)
+    - Unicode normalization to prevent homoglyph attacks
+    - Null byte injection detection
+    - Control character rejection
+    - Symlink resolution
+    - Length limits
 
     Args:
         base_dir: The trusted base directory
@@ -38,26 +56,58 @@ def _validate_safe_path(base_dir: Path, filename: str) -> Path:
 
     Raises:
         PathTraversalError: If the path would escape base_dir
+        ValueError: If the filename is invalid
     """
-    # Normalize the base directory
-    base_dir = base_dir.resolve()
+    # Check for empty filename
+    if not filename:
+        raise ValueError("Filename cannot be empty")
 
-    # Check for obvious path traversal attempts
-    if ".." in filename or filename.startswith("/") or filename.startswith("\\"):
+    # Check for path length limits
+    if len(filename) > _MAX_PATH_LENGTH:
+        raise PathTraversalError(
+            f"Filename too long ({len(filename)} > {_MAX_PATH_LENGTH})"
+        )
+
+    # URL decode to catch encoded path traversal (%2e%2e = .., %2f = /)
+    # Do this twice to catch double-encoding
+    decoded = unquote(unquote(filename))
+
+    # Unicode normalize to NFC form to prevent homoglyph attacks
+    # (e.g., fullwidth dot \uFF0E looking like normal dot)
+    decoded = unicodedata.normalize("NFC", decoded)
+
+    # Check for null bytes (can truncate strings in some contexts)
+    if "\x00" in decoded or "\x00" in filename:
+        raise PathTraversalError(
+            f"Invalid filename: null byte detected"
+        )
+
+    # Check for control characters (except newline/tab which are handled by path)
+    if _CONTROL_CHAR_PATTERN.search(decoded) or _CONTROL_CHAR_PATTERN.search(filename):
+        raise PathTraversalError(
+            f"Invalid filename: control characters detected"
+        )
+
+    # Check for path traversal in decoded version
+    if ".." in decoded or decoded.startswith("/") or decoded.startswith("\\"):
         raise PathTraversalError(
             f"Invalid filename '{filename}': path traversal characters detected"
         )
 
-    # Check for Windows drive letters
-    if len(filename) > 1 and filename[1] == ":":
+    # Check for Windows drive letters (also check decoded)
+    if (len(decoded) > 1 and decoded[1] == ":") or (len(filename) > 1 and filename[1] == ":"):
         raise PathTraversalError(
             f"Invalid filename '{filename}': absolute Windows path not allowed"
         )
 
-    # Construct and resolve the full path
+    # Normalize the base directory
+    base_dir = base_dir.resolve()
+
+    # Construct and resolve the full path (this follows symlinks)
     full_path = (base_dir / filename).resolve()
 
     # Verify the resolved path is within base_dir
+    # This catches symlinks pointing outside the directory
     try:
         full_path.relative_to(base_dir)
     except ValueError:

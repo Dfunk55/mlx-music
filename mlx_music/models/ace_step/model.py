@@ -294,6 +294,10 @@ class ACEStep:
             lyric_mask=lyric_mask,
         )
 
+    # Duration constraints (in seconds)
+    MIN_DURATION = 1.0  # ~1 second minimum
+    MAX_DURATION = 240.0  # ~4 minutes maximum
+
     def generate(
         self,
         prompt: str,
@@ -313,7 +317,7 @@ class ACEStep:
         Args:
             prompt: Text description of desired music
             lyrics: Optional lyrics for vocal generation
-            duration: Duration in seconds (max ~4 minutes)
+            duration: Duration in seconds (1-240 seconds, ~4 minutes max)
             num_inference_steps: Number of diffusion steps
             guidance_scale: CFG guidance scale
             seed: Random seed for reproducibility
@@ -324,7 +328,22 @@ class ACEStep:
 
         Returns:
             GenerationOutput with audio and metadata
+
+        Raises:
+            ValueError: If duration is outside valid range
         """
+        # Validate duration
+        if duration < self.MIN_DURATION:
+            raise ValueError(
+                f"Duration {duration}s is too short. "
+                f"Minimum duration is {self.MIN_DURATION}s"
+            )
+        if duration > self.MAX_DURATION:
+            raise ValueError(
+                f"Duration {duration}s is too long. "
+                f"Maximum duration is {self.MAX_DURATION}s (~{self.MAX_DURATION / 60:.0f} minutes)"
+            )
+
         # Set seed if provided
         if seed is not None:
             mx.random.seed(seed)
@@ -380,8 +399,14 @@ class ACEStep:
                     None,
                     None,
                 )
+                # Force evaluation to free intermediate tensors before CFG combination
+                mx.eval(noise_pred_uncond)
+
                 # CFG combination
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
+
+                # Evaluate combined prediction to free memory
+                mx.eval(noise_pred)
 
             # Scheduler step
             output = scheduler.step(noise_pred, t, latents)
@@ -391,7 +416,7 @@ class ACEStep:
             if callback is not None:
                 callback(i, t, latents)
 
-            # Evaluate for progress
+            # Evaluate for progress and memory management
             mx.eval(latents)
 
         # Decode to audio

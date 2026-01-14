@@ -159,3 +159,44 @@ class TestPathTraversalSecurity:
             json.dump({"weight_map": {"layer.weight": 12345}}, f)
         with pytest.raises(ValueError, match="shard filename must be string"):
             load_sharded_safetensors(tmp_path)
+
+    def test_path_traversal_url_encoded(self, tmp_path):
+        """Test that URL-encoded path traversal is blocked."""
+        # Single URL encoding
+        with pytest.raises(PathTraversalError, match="path traversal"):
+            _validate_safe_path(tmp_path, "%2e%2e%2f..%2fetc%2fpasswd")
+
+        with pytest.raises(PathTraversalError, match="path traversal"):
+            _validate_safe_path(tmp_path, "subdir%2f..%2f..%2f..%2fetc%2fpasswd")
+
+    def test_path_traversal_double_encoded(self, tmp_path):
+        """Test that double URL-encoded path traversal is blocked."""
+        with pytest.raises(PathTraversalError, match="path traversal"):
+            _validate_safe_path(tmp_path, "%252e%252e%252f..%252fetc%252fpasswd")
+
+    def test_null_byte_injection(self, tmp_path):
+        """Test that null bytes in filenames are rejected."""
+        with pytest.raises(PathTraversalError, match="null byte"):
+            _validate_safe_path(tmp_path, "safe.txt\x00../../etc/passwd")
+
+        with pytest.raises(PathTraversalError, match="null byte"):
+            _validate_safe_path(tmp_path, "model\x00.safetensors")
+
+    def test_control_characters_rejected(self, tmp_path):
+        """Test that control characters in filenames are rejected."""
+        with pytest.raises(PathTraversalError, match="control characters"):
+            _validate_safe_path(tmp_path, "model\x08.safetensors")
+
+        with pytest.raises(PathTraversalError, match="control characters"):
+            _validate_safe_path(tmp_path, "safe.txt\x0b../../etc/passwd")
+
+    def test_empty_filename_rejected(self, tmp_path):
+        """Test that empty filenames are rejected."""
+        with pytest.raises(ValueError, match="cannot be empty"):
+            _validate_safe_path(tmp_path, "")
+
+    def test_extremely_long_path(self, tmp_path):
+        """Test that very long paths are handled safely."""
+        long_name = "a" * 10000
+        with pytest.raises(PathTraversalError, match="too long"):
+            _validate_safe_path(tmp_path, long_name)
