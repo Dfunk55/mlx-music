@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-music"
+version = "0.1.0"
+description = "MLX-native music generation library for Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "MLX Music Contributors"}
+]
+keywords = ["mlx", "music", "generation", "apple-silicon", "machine-learning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Sound/Audio :: Sound Synthesis",
+]
+
+dependencies = [
+    "mlx>=0.25.0",
+    "numpy>=1.26.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.20.0",
+    "soundfile>=0.12.0",
+    "tqdm>=4.66.0",
+    "transformers>=4.40.0",
+    "sentencepiece>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "black>=24.0.0",
+    "isort>=5.13.0",
+    "mypy>=1.8.0",
+]
+
+[project.scripts]
+mlx-music = "mlx_music.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mlx-music/mlx-music"
+Repository = "https://github.com/mlx-music/mlx-music"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mlx_music*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
