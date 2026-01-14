@@ -298,6 +298,9 @@ class ACEStep:
     MIN_DURATION = 1.0  # ~1 second minimum
     MAX_DURATION = 240.0  # ~4 minutes maximum
 
+    # Latent dimension constraints
+    MAX_LATENT_WIDTH = 3000  # Based on architecture limits
+
     def generate(
         self,
         prompt: str,
@@ -353,6 +356,16 @@ class ACEStep:
         # Latent: 8 channels, 16 height, variable width
         # Width = duration * 44100 / (512 * 8) ≈ duration * 10.77
         latent_width = int(duration * 44100 / (512 * 8))
+
+        # Validate latent dimensions
+        if latent_width > self.MAX_LATENT_WIDTH:
+            max_safe_duration = self.MAX_LATENT_WIDTH * 512 * 8 / 44100
+            raise ValueError(
+                f"Duration {duration}s produces latent width {latent_width}, "
+                f"which exceeds maximum {self.MAX_LATENT_WIDTH}. "
+                f"Maximum safe duration is ~{max_safe_duration:.1f}s"
+            )
+
         latent_shape = (1, self.config.in_channels, self.config.max_height, latent_width)
 
         # Initialize noise
@@ -376,7 +389,7 @@ class ACEStep:
             # Expand timestep for batch
             timestep = mx.array([t] * latents.shape[0])
 
-            # Model prediction
+            # Model prediction (conditional)
             noise_pred = self._transformer_forward(
                 latents,
                 timestep,
@@ -389,6 +402,8 @@ class ACEStep:
 
             # Classifier-free guidance
             if guidance_scale > 1.0:
+                # Evaluate conditional prediction first to free intermediate tensors
+                mx.eval(noise_pred)
                 # Get unconditional prediction
                 noise_pred_uncond = self._transformer_forward(
                     latents,

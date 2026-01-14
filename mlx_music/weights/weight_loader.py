@@ -31,6 +31,18 @@ class PathTraversalError(ValueError):
 # Maximum allowed path length to prevent buffer overflow attacks
 _MAX_PATH_LENGTH = 4096
 
+# Maximum JSON file size to prevent memory exhaustion (10 MB)
+_MAX_JSON_SIZE = 10 * 1024 * 1024
+
+# Maximum number of shard files to prevent resource exhaustion
+_MAX_SHARD_COUNT = 1000
+
+# Maximum number of weight tensors to prevent memory exhaustion
+_MAX_WEIGHT_COUNT = 100_000
+
+# Maximum number of transformer blocks to prevent excessive memory allocation
+_MAX_NUM_LAYERS = 1000
+
 # Pattern to detect dangerous control characters (ASCII 0-31 except tab)
 _CONTROL_CHAR_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 
@@ -215,7 +227,14 @@ def load_sharded_safetensors(
     # Check for index file
     index_path = directory / "model.safetensors.index.json"
     if index_path.exists():
-        with open(index_path) as f:
+        # Check file size before loading to prevent memory exhaustion
+        index_size = index_path.stat().st_size
+        if index_size > _MAX_JSON_SIZE:
+            raise ValueError(
+                f"Index file too large: {index_size} bytes (max: {_MAX_JSON_SIZE})"
+            )
+
+        with open(index_path, encoding="utf-8") as f:
             index = json.load(f)
 
         # Validate index structure
@@ -228,6 +247,13 @@ def load_sharded_safetensors(
 
         # Get unique shard files and validate each one
         raw_shard_files = set(weight_map.values())
+
+        # Check shard count limit
+        if len(raw_shard_files) > _MAX_SHARD_COUNT:
+            raise ValueError(
+                f"Too many shard files: {len(raw_shard_files)} (max: {_MAX_SHARD_COUNT})"
+            )
+
         shard_files = []
         for shard_filename in raw_shard_files:
             if not isinstance(shard_filename, str):
@@ -242,6 +268,12 @@ def load_sharded_safetensors(
         # (glob is safe - only returns files within the directory)
         shard_files = list(directory.glob("*.safetensors"))
 
+        # Check shard count limit
+        if len(shard_files) > _MAX_SHARD_COUNT:
+            raise ValueError(
+                f"Too many shard files: {len(shard_files)} (max: {_MAX_SHARD_COUNT})"
+            )
+
     weights = {}
     iterator = tqdm(shard_files, desc="Loading weights") if show_progress else shard_files
 
@@ -249,6 +281,12 @@ def load_sharded_safetensors(
         # shard_path is already a validated Path object
         shard_weights = load_safetensors(shard_path, dtype=dtype)
         weights.update(shard_weights)
+
+        # Check weight count limit to prevent memory exhaustion
+        if len(weights) > _MAX_WEIGHT_COUNT:
+            raise ValueError(
+                f"Too many weight tensors: {len(weights)} (max: {_MAX_WEIGHT_COUNT})"
+            )
 
     return weights
 
@@ -577,11 +615,31 @@ def load_ace_step_weights(
     if not component_dir.exists():
         raise FileNotFoundError(f"Component directory not found: {component_dir}")
 
-    # Load config
+    # Load config with size limit and validation
     config_path = component_dir / "config.json"
     if config_path.exists():
-        with open(config_path) as f:
+        # Check config file size
+        config_size = config_path.stat().st_size
+        if config_size > _MAX_JSON_SIZE:
+            raise ValueError(
+                f"Config file too large: {config_size} bytes (max: {_MAX_JSON_SIZE})"
+            )
+
+        with open(config_path, encoding="utf-8") as f:
             config = json.load(f)
+
+        # Validate config structure
+        if not isinstance(config, dict):
+            raise ValueError("Invalid config file: expected a JSON object")
+
+        # Validate num_layers if present (used for generating mappings)
+        if "num_layers" in config:
+            num_layers = config["num_layers"]
+            if not isinstance(num_layers, int) or num_layers < 0 or num_layers > _MAX_NUM_LAYERS:
+                raise ValueError(
+                    f"Invalid num_layers in config: {num_layers} "
+                    f"(must be integer in range 0-{_MAX_NUM_LAYERS})"
+                )
     else:
         config = {}
 

@@ -391,7 +391,9 @@ class ISTFTCache:
         self.position_maxsize = position_maxsize
         self.norm_buffer_cache: OrderedDict = OrderedDict()
         self.position_cache: OrderedDict = OrderedDict()
-        self._lock = threading.Lock()
+        # Use RLock (reentrant lock) to allow recursive acquisition
+        # This is needed because get_norm_buffer calls get_positions
+        self._lock = threading.RLock()
 
     def _evict_oldest(self, cache: OrderedDict, maxsize: int) -> None:
         """Evict oldest items if cache exceeds maxsize."""
@@ -454,13 +456,8 @@ class ISTFTCache:
             frame_length = window.shape[0]
             ola_len = (num_frames - 1) * hop_length + frame_length
 
-            # Get positions (this will use its own cache)
-            # Release lock temporarily to avoid deadlock
-            self._lock.release()
-            try:
-                positions_flat = self.get_positions(num_frames, frame_length, hop_length)
-            finally:
-                self._lock.acquire()
+            # Get positions (RLock allows recursive acquisition)
+            positions_flat = self.get_positions(num_frames, frame_length, hop_length)
 
             window_squared = window**2
             norm_buffer = mx.zeros(ola_len, dtype=mx.float32)
