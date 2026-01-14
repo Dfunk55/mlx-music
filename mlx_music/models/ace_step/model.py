@@ -13,12 +13,14 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from mlx_music.models.ace_step.dcae import DCAE, DCAEConfig
 from mlx_music.models.ace_step.scheduler import (
     FlowMatchEulerDiscreteScheduler,
     get_scheduler,
     retrieve_timesteps,
 )
 from mlx_music.models.ace_step.transformer import ACEStepConfig, ACEStepTransformer
+from mlx_music.models.ace_step.vocoder import HiFiGANVocoder, MusicDCAEPipeline
 from mlx_music.weights.weight_loader import (
     download_model,
     load_ace_step_weights,
@@ -81,15 +83,13 @@ class ACEStep:
         transformer: ACEStepTransformer,
         config: ACEStepConfig,
         text_encoder: Optional[Any] = None,
-        dcae: Optional[Any] = None,
-        vocoder: Optional[Any] = None,
+        audio_pipeline: Optional[MusicDCAEPipeline] = None,
         dtype: mx.Dtype = mx.bfloat16,
     ):
         self.transformer = transformer
         self.config = config
         self.text_encoder = text_encoder
-        self.dcae = dcae
-        self.vocoder = vocoder
+        self.audio_pipeline = audio_pipeline
         self.dtype = dtype
 
         # Default scheduler
@@ -104,8 +104,7 @@ class ACEStep:
         model_path: Union[str, Path],
         dtype: mx.Dtype = mx.bfloat16,
         load_text_encoder: bool = True,
-        load_dcae: bool = True,
-        load_vocoder: bool = True,
+        load_audio_pipeline: bool = True,
     ) -> "ACEStep":
         """
         Load ACE-Step from pretrained weights.
@@ -114,8 +113,7 @@ class ACEStep:
             model_path: Path to model directory or HuggingFace repo ID
             dtype: Data type for model weights
             load_text_encoder: Whether to load text encoder
-            load_dcae: Whether to load DCAE (needed for full generation)
-            load_vocoder: Whether to load vocoder (needed for audio output)
+            load_audio_pipeline: Whether to load DCAE + vocoder (needed for audio output)
 
         Returns:
             ACEStep instance
@@ -142,29 +140,28 @@ class ACEStep:
         # Load weights into transformer
         transformer.load_weights(list(weights.items()))
 
-        # Initialize additional components (placeholders for now)
+        # Initialize additional components
         text_encoder = None
-        dcae = None
-        vocoder = None
+        audio_pipeline = None
 
         if load_text_encoder:
             print("Text encoder loading not yet implemented - using placeholder")
             # TODO: Load UMT5 encoder
 
-        if load_dcae:
-            print("DCAE loading not yet implemented - using placeholder")
-            # TODO: Load DCAE
-
-        if load_vocoder:
-            print("Vocoder loading not yet implemented - using placeholder")
-            # TODO: Load HiFi-GAN vocoder
+        if load_audio_pipeline:
+            print("Loading audio pipeline (DCAE + vocoder)...")
+            try:
+                audio_pipeline = MusicDCAEPipeline.from_pretrained(str(model_path), dtype=dtype)
+                print("Audio pipeline loaded successfully!")
+            except Exception as e:
+                print(f"Warning: Could not load audio pipeline: {e}")
+                print("Audio decoding will use placeholder (silence)")
 
         return cls(
             transformer=transformer,
             config=config,
             text_encoder=text_encoder,
-            dcae=dcae,
-            vocoder=vocoder,
+            audio_pipeline=audio_pipeline,
             dtype=dtype,
         )
 
@@ -223,14 +220,17 @@ class ACEStep:
         Returns:
             Audio waveform as numpy array
         """
-        if self.dcae is None or self.vocoder is None:
+        if self.audio_pipeline is None:
             # Return placeholder audio (silence)
             duration = latents.shape[-1] * 512 * 8 / 44100  # Approximate
             samples = int(duration * 44100)
             return np.zeros((2, samples), dtype=np.float32)
 
-        # TODO: Implement DCAE + vocoder decoding
-        raise NotImplementedError("Audio decoding not yet implemented")
+        # Decode using DCAE + vocoder pipeline
+        audio = self.audio_pipeline.decode(latents)
+
+        # Convert to numpy
+        return np.array(audio, dtype=np.float32)
 
     @mx.compile
     def _transformer_forward(
@@ -370,7 +370,6 @@ class ACEStep:
             f"  config={self.config},\n"
             f"  dtype={self.dtype},\n"
             f"  has_text_encoder={self.text_encoder is not None},\n"
-            f"  has_dcae={self.dcae is not None},\n"
-            f"  has_vocoder={self.vocoder is not None},\n"
+            f"  has_audio_pipeline={self.audio_pipeline is not None},\n"
             f")"
         )
