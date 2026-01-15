@@ -22,6 +22,10 @@ class MusicGenDecoderConfig:
     ffn_dim: int = 4096
     max_position_embeddings: int = 2048
 
+    # Cross-attention (encoder hidden size for K/V projections)
+    # T5-base has hidden_size=768
+    encoder_hidden_size: int = 768
+
     # Audio-specific
     num_codebooks: int = 4
     audio_channels: int = 1

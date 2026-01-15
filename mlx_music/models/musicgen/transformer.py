@@ -169,6 +169,7 @@ class MusicGenDecoderLayer(nn.Module):
         self.self_attn_layer_norm = nn.LayerNorm(config.hidden_size)
 
         # Cross-attention to encoder (text encoder outputs)
+        # Note: Encoder outputs are projected to decoder hidden size before cross-attention
         self.encoder_attn = MusicGenAttention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -255,6 +256,12 @@ class MusicGenDecoder(nn.Module):
         super().__init__()
         self.config = config
         self.num_codebooks = config.num_codebooks
+
+        # Encoder to decoder projection
+        # Projects T5 encoder outputs (768d) to decoder hidden size (1024d)
+        self.enc_to_dec_proj = nn.Linear(
+            config.encoder_hidden_size, config.hidden_size, bias=True
+        )
 
         # Token embeddings - one per codebook
         # MLX expects integer keys in dicts for proper weight loading
@@ -344,6 +351,11 @@ class MusicGenDecoder(nn.Module):
             )
             attention_mask = self._create_causal_mask(seq_len, cache_len)
 
+        # Project encoder hidden states to decoder hidden size
+        # This is done once and cached in cross_attn_past_key_values for incremental decoding
+        if encoder_hidden_states is not None:
+            encoder_hidden_states = self.enc_to_dec_proj(encoder_hidden_states)
+
         # Process through layers
         present_key_values = [] if use_cache else None
         cross_attn_present_key_values = [] if use_cache else None
@@ -427,6 +439,11 @@ def load_musicgen_decoder_weights(
     # Filter to decoder weights and remap keys
     decoder_weights = {}
     for key, value in all_weights.items():
+        # Handle enc_to_dec_proj at root level (projects encoder to decoder hidden size)
+        if key.startswith("enc_to_dec_proj."):
+            decoder_weights[key] = value.astype(dtype)
+            continue
+
         if not key.startswith("decoder."):
             continue
 
