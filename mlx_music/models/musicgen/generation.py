@@ -56,20 +56,17 @@ def top_k_filtering(logits: mx.array, top_k: int) -> mx.array:
     if top_k <= 0:
         return logits
 
-    # Get top-k values
+    # PERF: Use mx.topk (O(V)) instead of mx.sort (O(V log V))
     top_k = min(top_k, logits.shape[-1])
-    values = mx.sort(logits, axis=-1)[:, -top_k:]
-    # Use the value at position -top_k as threshold
-    # NOTE: Use < (not <=) because we want to keep values >= threshold
-    # But we need to handle duplicates at the threshold value
-    # The k-th largest value should be included
-    threshold = values[:, 0:1]  # (batch, 1) - this is the k-th largest value
+    top_values = mx.topk(logits, k=top_k, axis=-1)  # (batch, top_k) - not sorted
+    # The threshold is the minimum of the top-k values
+    threshold = mx.min(top_values, axis=-1, keepdims=True)  # (batch, 1)
 
     # Mask values strictly below threshold (keep values >= threshold)
     # This ensures all values equal to threshold are kept (may keep more than k if duplicates)
     mask = logits < threshold
-    neg_inf = mx.full(logits.shape, float("-inf"), dtype=logits.dtype)
-    return mx.where(mask, neg_inf, logits)
+    # PERF: Use scalars for mx.where instead of full tensor allocation
+    return mx.where(mask, float("-inf"), logits)
 
 
 def top_p_filtering(logits: mx.array, top_p: float) -> mx.array:
@@ -100,22 +97,15 @@ def top_p_filtering(logits: mx.array, top_p: float) -> mx.array:
         [mx.zeros_like(sorted_mask[:, :1]), sorted_mask[:, :-1]], axis=-1
     )
 
-    # Create output logits - copy and mask based on sorted positions
-    # Since top_p filters out low-probability tokens, we can process each batch
-    output_logits = logits.astype(mx.float32)  # Make a copy
-
-    # Use a vectorized approach with argsort to reverse the mapping
-    batch_size, vocab_size = logits.shape
+    # Reverse mapping to original order using argsort
     reverse_indices = mx.argsort(sorted_indices, axis=-1)
 
-    # Apply mask: for each position in original order, check if it should be masked
-    sorted_mask_float = sorted_mask.astype(mx.float32)
-
     # Gather sorted_mask at reverse_indices to get mask in original order
-    mask_original = mx.take_along_axis(sorted_mask_float, reverse_indices, axis=-1)
+    # PERF: Keep as boolean, use directly in mx.where (no float conversion needed)
+    mask_original = mx.take_along_axis(sorted_mask, reverse_indices, axis=-1)
 
-    neg_inf = mx.full(logits.shape, float("-inf"), dtype=logits.dtype)
-    return mx.where(mask_original > 0.5, neg_inf, logits)
+    # PERF: Use scalar for mx.where instead of full tensor allocation
+    return mx.where(mask_original, float("-inf"), logits)
 
 
 def sample_next_token(
@@ -328,15 +318,25 @@ class MusicGenGenerator:
             codes = mx.concatenate([codes, next_tokens], axis=-1)
 
             # Evaluate to prevent memory buildup (codes AND all KV caches)
-            mx.eval(codes)
+            # PERF: Single batched eval is much faster than multiple sequential evals
+            to_eval = [codes]
             if past_key_values is not None:
-                mx.eval(past_key_values)
+                for kv in past_key_values:
+                    if kv is not None:
+                        to_eval.extend(x for x in kv if x is not None)
             if cross_attn_past_key_values is not None:
-                mx.eval(cross_attn_past_key_values)
+                for kv in cross_attn_past_key_values:
+                    if kv is not None:
+                        to_eval.extend(x for x in kv if x is not None)
             if uncond_past_key_values is not None:
-                mx.eval(uncond_past_key_values)
+                for kv in uncond_past_key_values:
+                    if kv is not None:
+                        to_eval.extend(x for x in kv if x is not None)
             if uncond_cross_attn_past_key_values is not None:
-                mx.eval(uncond_cross_attn_past_key_values)
+                for kv in uncond_cross_attn_past_key_values:
+                    if kv is not None:
+                        to_eval.extend(x for x in kv if x is not None)
+            mx.eval(*to_eval)
 
             # Callback
             if callback is not None:

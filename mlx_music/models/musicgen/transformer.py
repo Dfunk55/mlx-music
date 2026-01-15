@@ -315,23 +315,34 @@ class MusicGenDecoder(nn.Module):
         batch_size, num_codebooks, seq_len = input_ids.shape
 
         # Embed tokens for each codebook and sum
-        hidden_states = mx.zeros((batch_size, seq_len, self.config.hidden_size))
-        for i in range(self.num_codebooks):
+        hidden_states = self.embed_tokens[0](input_ids[:, 0, :])
+        for i in range(1, self.num_codebooks):
             hidden_states = hidden_states + self.embed_tokens[i](input_ids[:, i, :])
 
         # Add position embeddings
         if position_ids is None:
-            past_len = past_key_values[0][0].shape[1] if past_key_values else 0
+            # Safely get past sequence length from cache (handle None, empty list, and None elements)
+            past_len = (
+                past_key_values[0][0].shape[1]
+                if past_key_values and len(past_key_values) > 0 and past_key_values[0] is not None
+                else 0
+            )
             position_ids = mx.arange(past_len, past_len + seq_len)
-            position_ids = mx.broadcast_to(position_ids, (batch_size, seq_len))
+            # PERF: Only broadcast when needed (batch_size > 1)
+            if batch_size > 1:
+                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_len))
 
         hidden_states = hidden_states + self.embed_positions(position_ids)
 
         # Create causal mask if not provided
         if attention_mask is None:
-            attention_mask = self._create_causal_mask(
-                seq_len, past_key_values[0][0].shape[1] if past_key_values else 0
+            # Safely get past sequence length from cache (handle None, empty list, and None elements)
+            cache_len = (
+                past_key_values[0][0].shape[1]
+                if past_key_values and len(past_key_values) > 0 and past_key_values[0] is not None
+                else 0
             )
+            attention_mask = self._create_causal_mask(seq_len, cache_len)
 
         # Process through layers
         present_key_values = [] if use_cache else None
@@ -374,10 +385,11 @@ class MusicGenDecoder(nn.Module):
         # Each position i can attend to positions 0 to past_len + i (inclusive)
         # So: col_indices <= past_len + row_indices
         # Mask positions where col > past_len + row
+        # PERF: Use scalars instead of full tensor allocations - MLX broadcasts efficiently
         causal_mask = mx.where(
             col_indices <= (past_len + row_indices),
-            mx.zeros((seq_len, total_len)),
-            mx.full((seq_len, total_len), float("-inf")),
+            0.0,
+            float("-inf"),
         )
         return causal_mask[None, None, :, :]  # (1, 1, seq_len, total_len)
 
