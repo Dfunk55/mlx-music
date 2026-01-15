@@ -308,6 +308,33 @@ def load_sharded_safetensors(
     return weights
 
 
+def _check_pytorch_version() -> None:
+    """
+    Verify PyTorch version supports weights_only parameter.
+
+    Raises:
+        ImportError: If PyTorch < 1.13.0 (weights_only not supported)
+    """
+    import torch
+
+    version_str = torch.__version__.split("+")[0]  # Remove +cu118 suffix etc.
+    try:
+        parts = version_str.split(".")
+        major, minor = int(parts[0]), int(parts[1])
+        if (major, minor) < (1, 13):
+            raise ImportError(
+                f"PyTorch >= 1.13.0 required for secure weight loading (weights_only=True). "
+                f"Current version: {torch.__version__}. "
+                f"Upgrade with: pip install 'torch>=1.13.0'"
+            )
+    except (ValueError, IndexError):
+        # Can't parse version, assume it's new enough
+        warnings.warn(
+            f"Could not parse PyTorch version '{torch.__version__}', "
+            f"assuming weights_only=True is supported"
+        )
+
+
 def load_pytorch_bin(
     path: Union[str, Path],
     dtype: mx.Dtype = mx.bfloat16,
@@ -323,7 +350,9 @@ def load_pytorch_bin(
         Dictionary mapping weight names to MLX arrays
 
     Note:
-        Requires PyTorch to be installed. Uses weights_only=True for security.
+        Requires PyTorch >= 1.13.0. Uses weights_only=True for security.
+        BFloat16 tensors are converted through float32 due to numpy limitations,
+        which may introduce minor precision differences.
     """
     try:
         import torch
@@ -333,28 +362,76 @@ def load_pytorch_bin(
             "Install with: pip install torch"
         )
 
+    # Verify PyTorch version supports weights_only
+    _check_pytorch_version()
+
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Weight file not found: {path}")
 
     # Load with weights_only=True for security (prevents arbitrary code execution)
     # map_location="cpu" prevents GPU memory usage during loading
-    torch_weights = torch.load(str(path), map_location="cpu", weights_only=True)
+    try:
+        torch_weights = torch.load(str(path), map_location="cpu", weights_only=True)
+    except TypeError as e:
+        if "weights_only" in str(e):
+            raise ImportError(
+                "Your PyTorch version does not support weights_only=True. "
+                "Upgrade to PyTorch >= 1.13.0 for secure loading."
+            ) from e
+        raise
+
+    # Validate that we got a dict
+    if not isinstance(torch_weights, dict):
+        raise ValueError(
+            f"Expected dict from torch.load, got {type(torch_weights).__name__}. "
+            f"File may be corrupted or not a valid weight file."
+        )
 
     # Convert to MLX arrays
     weights = {}
-    for key, tensor in torch_weights.items():
-        if isinstance(tensor, torch.Tensor):
+    for key, value in torch_weights.items():
+        # Validate key is a string
+        if not isinstance(key, str):
+            warnings.warn(
+                f"Skipping non-string key: {type(key).__name__}"
+            )
+            continue
+
+        if isinstance(value, torch.Tensor):
+            # Ensure tensor is on CPU (should be due to map_location, but be safe)
+            tensor = value.cpu()
+
             # Convert bfloat16 to float32 first (numpy doesn't support bf16)
             if tensor.dtype == torch.bfloat16:
                 tensor = tensor.float()
+
             # Convert to numpy then MLX
             np_array = tensor.numpy()
             arr = mx.array(np_array)
+
             # Convert to target dtype
             if arr.dtype != dtype and arr.dtype in (mx.float32, mx.float16, mx.bfloat16):
                 arr = arr.astype(dtype)
+
             weights[key] = arr
+
+            # Free tensor to reduce memory pressure
+            del tensor, np_array
+
+            # Check weight count limit
+            if len(weights) > _MAX_WEIGHT_COUNT:
+                raise ValueError(
+                    f"Too many weight tensors: {len(weights)} (max: {_MAX_WEIGHT_COUNT})"
+                )
+        else:
+            # Skip non-tensor values (metadata, etc.) with warning
+            warnings.warn(
+                f"Skipping non-tensor value for key '{key}': {type(value).__name__}"
+            )
+
+    # Free torch state dict
+    del torch_weights
 
     return weights
 
@@ -380,6 +457,8 @@ def load_sharded_pytorch(
         PathTraversalError: If index file contains invalid paths
         json.JSONDecodeError: If index file is malformed
     """
+    import gc
+
     directory = Path(directory).resolve()
 
     # Check for index file
@@ -408,6 +487,13 @@ def load_sharded_pytorch(
     if not isinstance(weight_map, dict):
         raise ValueError("Invalid index file: weight_map must be a dict")
 
+    # Validate weight_map keys are strings
+    for key in weight_map.keys():
+        if not isinstance(key, str):
+            raise ValueError(
+                f"Invalid index file: weight_map keys must be strings, got {type(key).__name__}"
+            )
+
     # Get unique shard files and validate each one
     raw_shard_files = set(weight_map.values())
 
@@ -425,6 +511,13 @@ def load_sharded_pytorch(
             )
         # Validate path is safe (no traversal)
         safe_path = _validate_safe_path(directory, shard_filename)
+
+        # Check shard file exists
+        if not safe_path.exists():
+            raise FileNotFoundError(
+                f"Shard file '{shard_filename}' from index not found: {safe_path}"
+            )
+
         shard_files.append(safe_path)
 
     # Load each shard
@@ -433,7 +526,20 @@ def load_sharded_pytorch(
 
     for shard_path in iterator:
         shard_weights = load_pytorch_bin(shard_path, dtype=dtype)
+
+        # Check for duplicate keys (data integrity warning)
+        duplicate_keys = set(weights.keys()) & set(shard_weights.keys())
+        if duplicate_keys:
+            warnings.warn(
+                f"Found {len(duplicate_keys)} duplicate keys across shards. "
+                f"Later shards will overwrite earlier ones. First few: {list(duplicate_keys)[:5]}"
+            )
+
         weights.update(shard_weights)
+
+        # Free shard dict and trigger garbage collection
+        del shard_weights
+        gc.collect()
 
         # Check weight count limit
         if len(weights) > _MAX_WEIGHT_COUNT:
