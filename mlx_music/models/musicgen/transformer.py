@@ -418,6 +418,9 @@ def load_musicgen_decoder_weights(
     3. pytorch_model.bin.index.json (sharded pytorch)
     4. pytorch_model.bin (single pytorch)
 
+    Uses lazy filtering to only load decoder weights, skipping audio_encoder
+    and text_encoder weights for memory efficiency.
+
     Args:
         model_path: Path to model directory
         dtype: Target dtype for weights
@@ -436,15 +439,33 @@ def load_musicgen_decoder_weights(
 
     model_path = Path(model_path)
 
+    # Define key filter for decoder weights only
+    # This enables lazy loading to skip audio_encoder and text_encoder weights
+    def decoder_key_filter(key: str) -> bool:
+        return key.startswith("decoder.") or key.startswith("enc_to_dec_proj.")
+
     # Try formats in order of preference
     if (model_path / "model.safetensors.index.json").exists():
-        all_weights = load_sharded_safetensors(model_path)
+        all_weights = load_sharded_safetensors(
+            model_path,
+            key_filter=decoder_key_filter,
+        )
     elif (model_path / "model.safetensors").exists():
-        all_weights = load_single_safetensors(model_path / "model.safetensors")
+        all_weights = load_single_safetensors(
+            model_path / "model.safetensors",
+            key_filter=decoder_key_filter,
+        )
     elif (model_path / "pytorch_model.bin.index.json").exists():
-        all_weights = load_sharded_pytorch(model_path)
+        all_weights = load_sharded_pytorch(
+            model_path,
+            key_filter=decoder_key_filter,
+            max_workers=2,  # Parallel loading for faster I/O
+        )
     elif (model_path / "pytorch_model.bin").exists():
-        all_weights = load_pytorch_bin(model_path / "pytorch_model.bin")
+        all_weights = load_pytorch_bin(
+            model_path / "pytorch_model.bin",
+            key_filter=decoder_key_filter,
+        )
     else:
         raise FileNotFoundError(
             f"No weights found in {model_path}. "

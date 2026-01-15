@@ -5,13 +5,17 @@ Handles loading SafeTensors weights from HuggingFace or local paths,
 converting from PyTorch format to MLX format.
 """
 
+import gc
 import json
 import os
 import re
+import threading
 import unicodedata
 import warnings
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote
 
@@ -42,6 +46,9 @@ _MAX_WEIGHT_COUNT = 100_000
 
 # Maximum number of transformer blocks to prevent excessive memory allocation
 _MAX_NUM_LAYERS = 1000
+
+# Maximum number of parallel workers to prevent thread exhaustion
+_MAX_WORKERS = 16
 
 # Pattern to detect dangerous control characters (ASCII 0-31 except tab)
 _CONTROL_CHAR_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
@@ -139,9 +146,51 @@ class WeightMapping:
     transform: Optional[Callable[[mx.array], mx.array]] = None
 
 
+def _validate_loader_params(
+    key_filter: Optional[Callable[[str], bool]] = None,
+    max_workers: Optional[int] = None,
+) -> int:
+    """
+    Validate common loader parameters.
+
+    Args:
+        key_filter: Optional callable to filter keys
+        max_workers: Optional number of parallel workers
+
+    Returns:
+        Validated max_workers value (capped to _MAX_WORKERS)
+
+    Raises:
+        TypeError: If key_filter is not callable
+        ValueError: If max_workers is invalid
+    """
+    # Validate key_filter
+    if key_filter is not None and not callable(key_filter):
+        raise TypeError(
+            f"key_filter must be callable, got {type(key_filter).__name__}"
+        )
+
+    # Validate and cap max_workers
+    if max_workers is not None:
+        if not isinstance(max_workers, int) or max_workers < 1:
+            raise ValueError(
+                f"max_workers must be a positive integer, got {max_workers}"
+            )
+        if max_workers > _MAX_WORKERS:
+            warnings.warn(
+                f"max_workers={max_workers} exceeds limit ({_MAX_WORKERS}), "
+                f"capping to {_MAX_WORKERS} to prevent resource exhaustion"
+            )
+            max_workers = _MAX_WORKERS
+        return max_workers
+
+    return 1  # Default
+
+
 def load_safetensors(
     path: Union[str, Path],
     dtype: mx.Dtype = mx.bfloat16,
+    key_filter: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, mx.array]:
     """
     Load weights from a SafeTensors file into MLX arrays.
@@ -149,10 +198,17 @@ def load_safetensors(
     Args:
         path: Path to the .safetensors file
         dtype: Target dtype for weights (default: bfloat16)
+        key_filter: Optional function to filter which keys to load.
+            If provided, only keys where key_filter(key) returns True are loaded.
+            WARNING: This function executes in an unrestricted context.
+            Only use trusted filter functions.
 
     Returns:
         Dictionary mapping weight names to MLX arrays
     """
+    # Validate parameters
+    _validate_loader_params(key_filter=key_filter)
+
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Weight file not found: {path}")
@@ -162,15 +218,18 @@ def load_safetensors(
     # Try using mlx.core's load function first (handles bfloat16 properly)
     try:
         # MLX can load safetensors directly
-        weights = mx.load(str(path))
-        # Convert to target dtype if needed
-        converted_weights = {}
-        for key, arr in weights.items():
+        all_weights = mx.load(str(path))
+        # Convert to target dtype and apply filter if needed
+        for key, arr in all_weights.items():
+            # Apply key filter if provided (skip early to save memory)
+            if key_filter is not None and not key_filter(key):
+                continue
+
             if arr.dtype != dtype and arr.dtype in (mx.float32, mx.float16, mx.bfloat16):
-                converted_weights[key] = arr.astype(dtype)
+                weights[key] = arr.astype(dtype)
             else:
-                converted_weights[key] = arr
-        return converted_weights
+                weights[key] = arr
+        return weights
     except FileNotFoundError:
         raise  # Re-raise file not found errors
     except (RuntimeError, ValueError) as e:
@@ -181,6 +240,10 @@ def load_safetensors(
     # This will convert bfloat16 to float32 first
     with safe_open(str(path), framework="numpy") as f:
         for key in f.keys():
+            # Apply key filter if provided (skip early to save memory)
+            if key_filter is not None and not key_filter(key):
+                continue
+
             try:
                 tensor = f.get_tensor(key)
                 # Convert numpy to MLX array
@@ -205,6 +268,7 @@ def load_safetensors(
 def load_single_safetensors(
     path: Union[str, Path],
     dtype: mx.Dtype = mx.bfloat16,
+    key_filter: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, mx.array]:
     """
     Load weights from a single SafeTensors file.
@@ -212,17 +276,20 @@ def load_single_safetensors(
     Args:
         path: Path to the .safetensors file
         dtype: Target dtype for weights
+        key_filter: Optional function to filter which keys to load.
 
     Returns:
         Dictionary mapping weight names to MLX arrays
     """
-    return load_safetensors(path, dtype=dtype)
+    return load_safetensors(path, dtype=dtype, key_filter=key_filter)
 
 
 def load_sharded_safetensors(
     directory: Union[str, Path],
     dtype: mx.Dtype = mx.bfloat16,
     show_progress: bool = True,
+    key_filter: Optional[Callable[[str], bool]] = None,
+    max_workers: int = 2,
 ) -> Dict[str, mx.array]:
     """
     Load weights from multiple sharded SafeTensors files.
@@ -231,6 +298,12 @@ def load_sharded_safetensors(
         directory: Directory containing .safetensors shards
         dtype: Target dtype for weights
         show_progress: Whether to show progress bar
+        key_filter: Optional function to filter which keys to load.
+            If provided, shards containing no matching keys are skipped entirely.
+            WARNING: This function executes in an unrestricted context.
+            Only use trusted filter functions.
+        max_workers: Number of parallel workers for loading shards.
+            Default 2 (parallel I/O). Set to 1 for sequential loading.
 
     Returns:
         Combined dictionary of all weights
@@ -239,10 +312,15 @@ def load_sharded_safetensors(
         PathTraversalError: If index file contains invalid paths
         json.JSONDecodeError: If index file is malformed
     """
+    # Validate parameters
+    max_workers = _validate_loader_params(key_filter=key_filter, max_workers=max_workers)
+
     directory = Path(directory).resolve()
 
     # Check for index file
     index_path = directory / "model.safetensors.index.json"
+    weight_map = None
+
     if index_path.exists():
         # Check file size before loading to prevent memory exhaustion
         index_size = index_path.stat().st_size
@@ -262,48 +340,134 @@ def load_sharded_safetensors(
         if not isinstance(weight_map, dict):
             raise ValueError("Invalid index file: weight_map must be a dict")
 
-        # Get unique shard files and validate each one
-        raw_shard_files = set(weight_map.values())
+    # Smart shard skipping if we have an index file and key_filter
+    if weight_map is not None:
+        # Group weights by shard file (using defaultdict for efficiency)
+        shard_to_keys: Dict[str, List[str]] = defaultdict(list)
+        for weight_key, shard_filename in weight_map.items():
+            shard_to_keys[shard_filename].append(weight_key)
 
-        # Check shard count limit
-        if len(raw_shard_files) > _MAX_SHARD_COUNT:
-            raise ValueError(
-                f"Too many shard files: {len(raw_shard_files)} (max: {_MAX_SHARD_COUNT})"
-            )
-
-        shard_files = []
-        for shard_filename in raw_shard_files:
+        # Filter shards: only load shards that contain at least one matching key
+        needed_shards = []
+        skipped_shards = []
+        for shard_filename, keys in shard_to_keys.items():
             if not isinstance(shard_filename, str):
                 raise ValueError(
                     f"Invalid index file: shard filename must be string, got {type(shard_filename)}"
                 )
+
+            # If key_filter provided, check if any keys in this shard match
+            if key_filter is not None:
+                matching_keys = [k for k in keys if key_filter(k)]
+                if not matching_keys:
+                    skipped_shards.append(shard_filename)
+                    continue
+
             # Validate path is safe (no traversal)
             safe_path = _validate_safe_path(directory, shard_filename)
-            shard_files.append(safe_path)
+            needed_shards.append(safe_path)
+
+        if skipped_shards and show_progress:
+            print(f"Skipping {len(skipped_shards)} shards (no matching keys)")
+
+        shard_files = needed_shards
     else:
         # Find all .safetensors files directly in the directory
         # (glob is safe - only returns files within the directory)
         shard_files = list(directory.glob("*.safetensors"))
 
-        # Check shard count limit
-        if len(shard_files) > _MAX_SHARD_COUNT:
-            raise ValueError(
-                f"Too many shard files: {len(shard_files)} (max: {_MAX_SHARD_COUNT})"
-            )
+    # Check shard count limit
+    if len(shard_files) > _MAX_SHARD_COUNT:
+        raise ValueError(
+            f"Too many shard files: {len(shard_files)} (max: {_MAX_SHARD_COUNT})"
+        )
 
+    # Load shards (parallel or sequential)
     weights = {}
-    iterator = tqdm(shard_files, desc="Loading weights") if show_progress else shard_files
 
-    for shard_path in iterator:
-        # shard_path is already a validated Path object
-        shard_weights = load_safetensors(shard_path, dtype=dtype)
-        weights.update(shard_weights)
+    def _load_single_shard(shard_path: Path) -> Dict[str, mx.array]:
+        """Load a single shard with key filtering."""
+        return load_safetensors(shard_path, dtype=dtype, key_filter=key_filter)
 
-        # Check weight count limit to prevent memory exhaustion
-        if len(weights) > _MAX_WEIGHT_COUNT:
-            raise ValueError(
-                f"Too many weight tensors: {len(weights)} (max: {_MAX_WEIGHT_COUNT})"
-            )
+    if max_workers > 1 and len(shard_files) > 1:
+        # Parallel loading with ThreadPoolExecutor
+        # Note: This is thread-safe because:
+        # - Worker threads only READ from paths and CREATE new dicts
+        # - Main thread iterates as_completed() and does all WRITES to weights dict
+        # - No Lock needed since all dict modifications happen in main thread
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_load_single_shard, path): path
+                for path in shard_files
+            }
+
+            # Progress tracking with tqdm
+            if show_progress:
+                iterator = tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=f"Loading weights ({max_workers} workers)"
+                )
+            else:
+                iterator = as_completed(futures)
+
+            shards_processed = 0
+            for future in iterator:
+                shard_path = futures[future]
+                try:
+                    shard_weights = future.result()
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load shard {shard_path.name}: {e}") from e
+
+                # Check for duplicate keys (data integrity warning)
+                duplicate_keys = set(weights.keys()) & set(shard_weights.keys())
+                if duplicate_keys:
+                    warnings.warn(
+                        f"Found {len(duplicate_keys)} duplicate keys across shards. "
+                        f"Later shards will overwrite earlier ones. First few: {list(duplicate_keys)[:5]}"
+                    )
+
+                # Check weight count limit BEFORE updating
+                if len(weights) + len(shard_weights) > _MAX_WEIGHT_COUNT:
+                    raise ValueError(
+                        f"Too many weight tensors: {len(weights)} + {len(shard_weights)} "
+                        f"would exceed max ({_MAX_WEIGHT_COUNT})"
+                    )
+
+                weights.update(shard_weights)
+                del shard_weights
+                shards_processed += 1
+
+                # Periodic gc.collect() to prevent memory pressure (every 2 shards)
+                if shards_processed % 2 == 0:
+                    gc.collect()
+    else:
+        # Sequential loading (existing behavior)
+        iterator = tqdm(shard_files, desc="Loading weights") if show_progress else shard_files
+
+        for shard_path in iterator:
+            shard_weights = _load_single_shard(shard_path)
+
+            # Check for duplicate keys (data integrity warning)
+            duplicate_keys = set(weights.keys()) & set(shard_weights.keys())
+            if duplicate_keys:
+                warnings.warn(
+                    f"Found {len(duplicate_keys)} duplicate keys across shards. "
+                    f"Later shards will overwrite earlier ones. First few: {list(duplicate_keys)[:5]}"
+                )
+
+            # Check weight count limit BEFORE updating
+            if len(weights) + len(shard_weights) > _MAX_WEIGHT_COUNT:
+                raise ValueError(
+                    f"Too many weight tensors: {len(weights)} + {len(shard_weights)} "
+                    f"would exceed max ({_MAX_WEIGHT_COUNT})"
+                )
+
+            weights.update(shard_weights)
+
+            # Free shard dict and trigger garbage collection (sequential mode)
+            del shard_weights
+            gc.collect()
 
     return weights
 
@@ -338,6 +502,7 @@ def _check_pytorch_version() -> None:
 def load_pytorch_bin(
     path: Union[str, Path],
     dtype: mx.Dtype = mx.bfloat16,
+    key_filter: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, mx.array]:
     """
     Load weights from a PyTorch .bin file into MLX arrays.
@@ -345,6 +510,9 @@ def load_pytorch_bin(
     Args:
         path: Path to the .bin file
         dtype: Target dtype for weights (default: bfloat16)
+        key_filter: Optional function to filter which keys to load.
+            If provided, only keys where key_filter(key) returns True are loaded.
+            This saves memory by skipping unneeded weights during iteration.
 
     Returns:
         Dictionary mapping weight names to MLX arrays
@@ -354,6 +522,9 @@ def load_pytorch_bin(
         BFloat16 tensors are converted through float32 due to numpy limitations,
         which may introduce minor precision differences.
     """
+    # Validate parameters
+    _validate_loader_params(key_filter=key_filter)
+
     try:
         import torch
     except ImportError:
@@ -390,12 +561,18 @@ def load_pytorch_bin(
 
     # Convert to MLX arrays
     weights = {}
+    skipped_by_filter = 0
     for key, value in torch_weights.items():
         # Validate key is a string
         if not isinstance(key, str):
             warnings.warn(
                 f"Skipping non-string key: {type(key).__name__}"
             )
+            continue
+
+        # Apply key filter if provided (skip early to save memory)
+        if key_filter is not None and not key_filter(key):
+            skipped_by_filter += 1
             continue
 
         if isinstance(value, torch.Tensor):
@@ -440,6 +617,8 @@ def load_sharded_pytorch(
     directory: Union[str, Path],
     dtype: mx.Dtype = mx.bfloat16,
     show_progress: bool = True,
+    key_filter: Optional[Callable[[str], bool]] = None,
+    max_workers: int = 2,
 ) -> Dict[str, mx.array]:
     """
     Load weights from multiple sharded PyTorch .bin files.
@@ -448,6 +627,13 @@ def load_sharded_pytorch(
         directory: Directory containing .bin shards and pytorch_model.bin.index.json
         dtype: Target dtype for weights
         show_progress: Whether to show progress bar
+        key_filter: Optional function to filter which keys to load.
+            If provided, shards containing no matching keys are skipped entirely.
+            Remaining shards only load weights where key_filter(key) returns True.
+            WARNING: This function executes in an unrestricted context.
+            Only use trusted filter functions.
+        max_workers: Number of parallel workers for loading shards.
+            Default 2 (parallel I/O). Set to 1 for sequential loading.
 
     Returns:
         Combined dictionary of all weights
@@ -457,7 +643,8 @@ def load_sharded_pytorch(
         PathTraversalError: If index file contains invalid paths
         json.JSONDecodeError: If index file is malformed
     """
-    import gc
+    # Validate parameters
+    max_workers = _validate_loader_params(key_filter=key_filter, max_workers=max_workers)
 
     directory = Path(directory).resolve()
 
@@ -494,21 +681,28 @@ def load_sharded_pytorch(
                 f"Invalid index file: weight_map keys must be strings, got {type(key).__name__}"
             )
 
-    # Get unique shard files and validate each one
-    raw_shard_files = set(weight_map.values())
+    # Smart shard skipping: determine which shards are needed based on key_filter
+    # Group weights by shard file (using defaultdict for efficiency)
+    shard_to_keys: Dict[str, List[str]] = defaultdict(list)
+    for weight_key, shard_filename in weight_map.items():
+        shard_to_keys[shard_filename].append(weight_key)
 
-    # Check shard count limit
-    if len(raw_shard_files) > _MAX_SHARD_COUNT:
-        raise ValueError(
-            f"Too many shard files: {len(raw_shard_files)} (max: {_MAX_SHARD_COUNT})"
-        )
-
-    shard_files = []
-    for shard_filename in raw_shard_files:
+    # Filter shards: only load shards that contain at least one matching key
+    needed_shards = []
+    skipped_shards = []
+    for shard_filename, keys in shard_to_keys.items():
         if not isinstance(shard_filename, str):
             raise ValueError(
                 f"Invalid index file: shard filename must be string, got {type(shard_filename)}"
             )
+
+        # If key_filter provided, check if any keys in this shard match
+        if key_filter is not None:
+            matching_keys = [k for k in keys if key_filter(k)]
+            if not matching_keys:
+                skipped_shards.append(shard_filename)
+                continue
+
         # Validate path is safe (no traversal)
         safe_path = _validate_safe_path(directory, shard_filename)
 
@@ -518,34 +712,103 @@ def load_sharded_pytorch(
                 f"Shard file '{shard_filename}' from index not found: {safe_path}"
             )
 
-        shard_files.append(safe_path)
+        needed_shards.append(safe_path)
 
-    # Load each shard
+    # Check shard count limit (after filtering)
+    if len(needed_shards) > _MAX_SHARD_COUNT:
+        raise ValueError(
+            f"Too many shard files: {len(needed_shards)} (max: {_MAX_SHARD_COUNT})"
+        )
+
+    if skipped_shards and show_progress:
+        print(f"Skipping {len(skipped_shards)} shards (no matching keys)")
+
+    # Load shards (parallel or sequential)
     weights = {}
-    iterator = tqdm(shard_files, desc="Loading PyTorch weights") if show_progress else shard_files
 
-    for shard_path in iterator:
-        shard_weights = load_pytorch_bin(shard_path, dtype=dtype)
+    def _load_single_shard(shard_path: Path) -> Dict[str, mx.array]:
+        """Load a single shard with key filtering."""
+        return load_pytorch_bin(shard_path, dtype=dtype, key_filter=key_filter)
 
-        # Check for duplicate keys (data integrity warning)
-        duplicate_keys = set(weights.keys()) & set(shard_weights.keys())
-        if duplicate_keys:
-            warnings.warn(
-                f"Found {len(duplicate_keys)} duplicate keys across shards. "
-                f"Later shards will overwrite earlier ones. First few: {list(duplicate_keys)[:5]}"
-            )
+    if max_workers > 1 and len(needed_shards) > 1:
+        # Parallel loading with ThreadPoolExecutor
+        # Note: This is thread-safe because:
+        # - Worker threads only READ from paths and CREATE new dicts
+        # - Main thread iterates as_completed() and does all WRITES to weights dict
+        # - No Lock needed since all dict modifications happen in main thread
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_load_single_shard, path): path
+                for path in needed_shards
+            }
 
-        weights.update(shard_weights)
+            # Progress tracking with tqdm
+            if show_progress:
+                iterator = tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=f"Loading PyTorch weights ({max_workers} workers)"
+                )
+            else:
+                iterator = as_completed(futures)
 
-        # Free shard dict and trigger garbage collection
-        del shard_weights
-        gc.collect()
+            shards_processed = 0
+            for future in iterator:
+                shard_path = futures[future]
+                try:
+                    shard_weights = future.result()
+                except Exception as e:
+                    raise RuntimeError(f"Failed to load shard {shard_path.name}: {e}") from e
 
-        # Check weight count limit
-        if len(weights) > _MAX_WEIGHT_COUNT:
-            raise ValueError(
-                f"Too many weight tensors: {len(weights)} (max: {_MAX_WEIGHT_COUNT})"
-            )
+                # Check for duplicate keys (data integrity warning)
+                duplicate_keys = set(weights.keys()) & set(shard_weights.keys())
+                if duplicate_keys:
+                    warnings.warn(
+                        f"Found {len(duplicate_keys)} duplicate keys across shards. "
+                        f"Later shards will overwrite earlier ones. First few: {list(duplicate_keys)[:5]}"
+                    )
+
+                # Check weight count limit BEFORE updating
+                if len(weights) + len(shard_weights) > _MAX_WEIGHT_COUNT:
+                    raise ValueError(
+                        f"Too many weight tensors: {len(weights)} + {len(shard_weights)} "
+                        f"would exceed max ({_MAX_WEIGHT_COUNT})"
+                    )
+
+                weights.update(shard_weights)
+                del shard_weights
+                shards_processed += 1
+
+                # Periodic gc.collect() to prevent memory pressure (every 2 shards)
+                if shards_processed % 2 == 0:
+                    gc.collect()
+    else:
+        # Sequential loading (existing behavior)
+        iterator = tqdm(needed_shards, desc="Loading PyTorch weights") if show_progress else needed_shards
+
+        for shard_path in iterator:
+            shard_weights = _load_single_shard(shard_path)
+
+            # Check for duplicate keys (data integrity warning)
+            duplicate_keys = set(weights.keys()) & set(shard_weights.keys())
+            if duplicate_keys:
+                warnings.warn(
+                    f"Found {len(duplicate_keys)} duplicate keys across shards. "
+                    f"Later shards will overwrite earlier ones. First few: {list(duplicate_keys)[:5]}"
+                )
+
+            # Check weight count limit BEFORE updating
+            if len(weights) + len(shard_weights) > _MAX_WEIGHT_COUNT:
+                raise ValueError(
+                    f"Too many weight tensors: {len(weights)} + {len(shard_weights)} "
+                    f"would exceed max ({_MAX_WEIGHT_COUNT})"
+                )
+
+            weights.update(shard_weights)
+
+            # Free shard dict and trigger garbage collection (sequential mode)
+            del shard_weights
+            gc.collect()
 
     return weights
 
