@@ -5,7 +5,7 @@ Sampling strategies and autoregressive generation for MusicGen.
 """
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import numpy as np
@@ -23,9 +23,16 @@ class GenerationConfig:
     temperature: float = 1.0
     top_k: int = 250
     top_p: float = 0.0  # 0.0 = disabled
+    use_sampling: bool = True  # False = greedy decoding (always take argmax)
 
     # Classifier-free guidance
     guidance_scale: float = 3.0
+    guidance_scale_beta: float = 0.0  # Secondary CFG scale (for melody), 0 = disabled
+
+    # Extended generation (>30s)
+    extend_stride: int = 750  # tokens per extension (~15s at 50fps)
+    window_length: int = 1500  # max tokens per window (~30s at 50fps)
+    fade_duration: float = 0.5  # crossfade duration in seconds
 
     # Generation
     seed: Optional[int] = None
@@ -113,6 +120,7 @@ def sample_next_token(
     temperature: float = 1.0,
     top_k: int = 250,
     top_p: float = 0.0,
+    use_sampling: bool = True,
 ) -> mx.array:
     """
     Sample next token from logits.
@@ -122,10 +130,16 @@ def sample_next_token(
         temperature: Sampling temperature (must be > 0, use very small for greedy)
         top_k: Top-k filtering (0 = disabled)
         top_p: Nucleus sampling threshold (0.0 = disabled)
+        use_sampling: If False, always use greedy decoding (argmax)
 
     Returns:
         (batch, 1) sampled token indices
     """
+    # Greedy decoding: always take argmax
+    if not use_sampling:
+        next_token = mx.argmax(logits, axis=-1)
+        return next_token[:, None]
+
     # Handle temperature = 0 or near-zero (greedy decoding)
     # Near-zero temperatures cause numerical overflow when dividing logits
     if temperature <= 1e-6:
@@ -157,22 +171,89 @@ def apply_classifier_free_guidance(
     cond_logits: mx.array,
     uncond_logits: mx.array,
     guidance_scale: float,
+    cond_beta_logits: Optional[mx.array] = None,
+    guidance_scale_beta: float = 0.0,
 ) -> mx.array:
     """
     Apply classifier-free guidance to logits.
 
+    Supports both single and double CFG:
+    - Single CFG: uncond + scale * (cond - uncond)
+    - Double CFG: uncond + scale * (cond - uncond) + scale_beta * (cond_beta - uncond)
+
     Args:
-        cond_logits: Conditioned logits
-        uncond_logits: Unconditioned logits
-        guidance_scale: CFG scale (1.0 = no guidance)
+        cond_logits: Primary conditioned logits (e.g., text + melody)
+        uncond_logits: Unconditioned logits (empty text)
+        guidance_scale: Primary CFG scale (1.0 = no guidance)
+        cond_beta_logits: Secondary conditioned logits (e.g., text only, no melody)
+        guidance_scale_beta: Secondary CFG scale (0.0 = disabled)
 
     Returns:
         Guided logits
     """
-    if guidance_scale == 1.0:
+    if guidance_scale == 1.0 and guidance_scale_beta == 0.0:
         return cond_logits
 
-    return uncond_logits + guidance_scale * (cond_logits - uncond_logits)
+    # Standard single CFG
+    result = uncond_logits + guidance_scale * (cond_logits - uncond_logits)
+
+    # Double CFG: add secondary guidance if enabled
+    if cond_beta_logits is not None and guidance_scale_beta > 0.0:
+        result = result + guidance_scale_beta * (cond_beta_logits - uncond_logits)
+
+    return result
+
+
+def blend_overlapping_audio(
+    prev_audio: np.ndarray,
+    curr_audio: np.ndarray,
+    overlap_samples: int,
+    fade_samples: int,
+) -> np.ndarray:
+    """
+    Blend two overlapping audio segments with linear crossfade.
+
+    Args:
+        prev_audio: Previous audio segment (..., samples)
+        curr_audio: Current audio segment (..., samples), with overlap_samples overlap
+        overlap_samples: Number of samples that overlap between segments
+        fade_samples: Number of samples for crossfade (within overlap region)
+
+    Returns:
+        Blended audio with smooth transition
+    """
+    if overlap_samples <= 0:
+        # No overlap, just concatenate
+        return np.concatenate([prev_audio, curr_audio], axis=-1)
+
+    # Ensure fade_samples doesn't exceed overlap
+    fade_samples = min(fade_samples, overlap_samples)
+
+    # Get the overlapping regions
+    prev_overlap = prev_audio[..., -overlap_samples:]
+    curr_overlap = curr_audio[..., :overlap_samples]
+
+    # Create linear fade weights
+    fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+    fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+
+    # Apply crossfade in the fade region
+    blended_overlap = prev_overlap.copy()
+    blended_overlap[..., :fade_samples] = (
+        prev_overlap[..., :fade_samples] * fade_out
+        + curr_overlap[..., :fade_samples] * fade_in
+    )
+    # After fade region, use current audio for rest of overlap
+    blended_overlap[..., fade_samples:] = curr_overlap[..., fade_samples:]
+
+    # Combine: prev (without overlap) + blended overlap + curr (after overlap)
+    result = np.concatenate([
+        prev_audio[..., :-overlap_samples],
+        blended_overlap,
+        curr_audio[..., overlap_samples:],
+    ], axis=-1)
+
+    return result
 
 
 class MusicGenGenerator:
@@ -208,32 +289,36 @@ class MusicGenGenerator:
 
     def generate(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         duration: float = 10.0,
         temperature: float = 1.0,
         top_k: int = 250,
         top_p: float = 0.0,
         guidance_scale: float = 3.0,
+        use_sampling: bool = True,
         seed: Optional[int] = None,
         callback: Optional[Callable[[int, int, mx.array], None]] = None,
         return_codes: bool = False,
-    ) -> GenerationOutput:
+    ) -> Union[GenerationOutput, List[GenerationOutput]]:
         """
-        Generate music from text prompt.
+        Generate music from text prompt(s).
+
+        Supports batch generation when prompt is a list.
 
         Args:
-            prompt: Text description of desired music
+            prompt: Text description(s) of desired music (str or list of str)
             duration: Target duration in seconds
             temperature: Sampling temperature
             top_k: Top-k filtering
             top_p: Nucleus sampling threshold
             guidance_scale: Classifier-free guidance scale
+            use_sampling: If False, use greedy decoding (deterministic)
             seed: Random seed for reproducibility
             callback: Optional callback(step, total_steps, codes)
             return_codes: Whether to return raw audio codes
 
         Returns:
-            GenerationOutput with audio and metadata
+            GenerationOutput (single) or List[GenerationOutput] (batch)
         """
         # Validate duration
         if duration <= 0:
@@ -250,15 +335,24 @@ class MusicGenGenerator:
         frame_rate = self.config.frame_rate
         target_length = max(1, int(duration * frame_rate))  # At least 1 step
 
-        # Encode text prompt
-        encoder_hidden_states, encoder_attention_mask = self.text_encoder.encode(prompt)
+        # Handle batch vs single prompt
+        if isinstance(prompt, list):
+            if len(prompt) == 0:
+                raise ValueError("prompt list cannot be empty")
+            batch_size = len(prompt)
+            encoder_hidden_states, encoder_attention_mask = self.text_encoder.encode_batch(prompt)
+        else:
+            batch_size = 1
+            encoder_hidden_states, encoder_attention_mask = self.text_encoder.encode(prompt)
 
         # For CFG, also need unconditional encoding (empty prompt)
         if guidance_scale > 1.0:
-            uncond_hidden_states, uncond_mask = self.text_encoder.encode("")
+            if batch_size > 1:
+                uncond_hidden_states, uncond_mask = self.text_encoder.encode_batch([""] * batch_size)
+            else:
+                uncond_hidden_states, uncond_mask = self.text_encoder.encode("")
 
         # Initialize with BOS tokens for all codebooks
-        batch_size = 1
         num_codebooks = self.config.decoder.num_codebooks
         bos_token = self.config.decoder.bos_token_id
 
@@ -311,7 +405,7 @@ class MusicGenGenerator:
             next_tokens = []
             for cb in range(num_codebooks):
                 cb_logits = next_logits[:, cb, :]
-                next_token = sample_next_token(cb_logits, temperature, top_k, top_p)
+                next_token = sample_next_token(cb_logits, temperature, top_k, top_p, use_sampling)
                 next_tokens.append(next_token)
 
             next_tokens = mx.stack(next_tokens, axis=1)  # (batch, num_codebooks, 1)
@@ -349,16 +443,32 @@ class MusicGenGenerator:
         audio = self.encodec.decode(codes)
         audio_np = np.array(audio)
 
-        # Remove batch dimension if present
-        if audio_np.ndim == 3:
-            audio_np = audio_np[0]
-
-        return GenerationOutput(
-            audio=audio_np,
-            sample_rate=self.config.audio_encoder.sampling_rate,
-            duration=duration,
-            codes=codes if return_codes else None,
-        )
+        # Handle batch vs single output
+        sample_rate = self.config.audio_encoder.sampling_rate
+        if batch_size == 1:
+            # Single output: remove batch dimension
+            if audio_np.ndim == 3:
+                audio_np = audio_np[0]
+            return GenerationOutput(
+                audio=audio_np,
+                sample_rate=sample_rate,
+                duration=duration,
+                codes=codes if return_codes else None,
+            )
+        else:
+            # Batch output: return list of GenerationOutput
+            # audio_np is always (batch, channels, samples) for batch generation
+            outputs = []
+            for i in range(batch_size):
+                batch_audio = audio_np[i]  # (channels, samples)
+                batch_codes = codes[i:i+1] if return_codes else None
+                outputs.append(GenerationOutput(
+                    audio=batch_audio,
+                    sample_rate=sample_rate,
+                    duration=duration,
+                    codes=batch_codes,
+                ))
+            return outputs
 
     def generate_continuation(
         self,
@@ -369,6 +479,7 @@ class MusicGenGenerator:
         top_k: int = 250,
         top_p: float = 0.0,
         guidance_scale: float = 3.0,
+        use_sampling: bool = True,
         seed: Optional[int] = None,
         callback: Optional[Callable[[int, int, mx.array], None]] = None,
         return_codes: bool = False,
@@ -524,7 +635,7 @@ class MusicGenGenerator:
             next_tokens = []
             for cb in range(num_codebooks):
                 cb_logits = next_logits[:, cb, :]
-                next_token = sample_next_token(cb_logits, temperature, top_k, top_p)
+                next_token = sample_next_token(cb_logits, temperature, top_k, top_p, use_sampling)
                 next_tokens.append(next_token)
 
             next_tokens = mx.stack(next_tokens, axis=1)
@@ -585,6 +696,8 @@ class MusicGenGenerator:
         top_k: int = 250,
         top_p: float = 0.0,
         guidance_scale: float = 3.0,
+        guidance_scale_beta: float = 0.0,
+        use_sampling: bool = True,
         seed: Optional[int] = None,
         callback: Optional[Callable[[int, int, mx.array], None]] = None,
         return_codes: bool = False,
@@ -596,6 +709,11 @@ class MusicGenGenerator:
         The model attends to both text embeddings (for style) and chroma embeddings
         (for melody) simultaneously via cross-attention.
 
+        Supports double CFG when guidance_scale_beta > 0:
+        - Conditional path: text + melody
+        - Beta path: text only (no melody)
+        - Unconditional path: empty text
+
         Args:
             prompt: Text description of desired music
             melody_audio: Reference audio for melody extraction (samples,) or (channels, samples)
@@ -604,7 +722,9 @@ class MusicGenGenerator:
             temperature: Sampling temperature
             top_k: Top-k filtering
             top_p: Nucleus sampling threshold
-            guidance_scale: Classifier-free guidance scale
+            guidance_scale: Primary CFG scale (text+melody vs unconditional)
+            guidance_scale_beta: Secondary CFG scale (text-only vs unconditional), 0 = disabled
+            use_sampling: If False, use greedy decoding
             seed: Random seed for reproducibility
             callback: Optional progress callback
             return_codes: Whether to return raw audio codes
@@ -659,9 +779,19 @@ class MusicGenGenerator:
         # Evaluate combined embeddings to prevent memory buildup
         mx.eval(combined_hidden_states, combined_mask)
 
-        # For CFG, also need unconditional encoding (text only, no melody)
-        if guidance_scale > 1.0:
+        # For CFG, need unconditional encoding (empty text)
+        uncond_hidden_states = None
+        uncond_mask = None
+        if guidance_scale > 1.0 or guidance_scale_beta > 0.0:
             uncond_hidden_states, uncond_mask = self.text_encoder.encode("")
+
+        # For double CFG (beta path), text-only conditioning (no melody)
+        # This is just the original text encoder output without chroma
+        beta_hidden_states = None
+        beta_mask = None
+        if guidance_scale_beta > 0.0:
+            beta_hidden_states = encoder_hidden_states
+            beta_mask = encoder_attention_mask
 
         # Initialize with BOS tokens
         batch_size = 1
@@ -674,6 +804,8 @@ class MusicGenGenerator:
         cross_attn_past_key_values = None
         uncond_past_key_values = None
         uncond_cross_attn_past_key_values = None
+        beta_past_key_values = None
+        beta_cross_attn_past_key_values = None
 
         # Generation loop with melody conditioning
         for step in range(target_length):
@@ -689,8 +821,9 @@ class MusicGenGenerator:
 
             next_logits = logits[:, :, -1, :]
 
-            # Apply CFG (unconditional path without melody)
-            if guidance_scale > 1.0:
+            # Apply CFG (unconditional path and optional beta path)
+            if guidance_scale > 1.0 or guidance_scale_beta > 0.0:
+                # Unconditional path (empty text)
                 uncond_logits, uncond_past_key_values, uncond_cross_attn_past_key_values = self.decoder(
                     input_ids=codes if uncond_past_key_values is None else codes[:, :, -1:],
                     encoder_hidden_states=uncond_hidden_states if uncond_cross_attn_past_key_values is None else None,
@@ -700,15 +833,31 @@ class MusicGenGenerator:
                     use_cache=True,
                 )
                 uncond_next = uncond_logits[:, :, -1, :]
+
+                # Beta path (text-only, no melody) for double CFG
+                beta_next = None
+                if guidance_scale_beta > 0.0:
+                    beta_logits, beta_past_key_values, beta_cross_attn_past_key_values = self.decoder(
+                        input_ids=codes if beta_past_key_values is None else codes[:, :, -1:],
+                        encoder_hidden_states=beta_hidden_states if beta_cross_attn_past_key_values is None else None,
+                        encoder_attention_mask=beta_mask,
+                        past_key_values=beta_past_key_values,
+                        cross_attn_past_key_values=beta_cross_attn_past_key_values,
+                        use_cache=True,
+                    )
+                    beta_next = beta_logits[:, :, -1, :]
+
                 next_logits = apply_classifier_free_guidance(
-                    next_logits, uncond_next, guidance_scale
+                    next_logits, uncond_next, guidance_scale,
+                    cond_beta_logits=beta_next,
+                    guidance_scale_beta=guidance_scale_beta,
                 )
 
             # Sample next tokens
             next_tokens = []
             for cb in range(num_codebooks):
                 cb_logits = next_logits[:, cb, :]
-                next_token = sample_next_token(cb_logits, temperature, top_k, top_p)
+                next_token = sample_next_token(cb_logits, temperature, top_k, top_p, use_sampling)
                 next_tokens.append(next_token)
 
             next_tokens = mx.stack(next_tokens, axis=1)
@@ -730,6 +879,14 @@ class MusicGenGenerator:
                         to_eval.extend(x for x in kv if x is not None)
             if uncond_cross_attn_past_key_values is not None:
                 for kv in uncond_cross_attn_past_key_values:
+                    if kv is not None:
+                        to_eval.extend(x for x in kv if x is not None)
+            if beta_past_key_values is not None:
+                for kv in beta_past_key_values:
+                    if kv is not None:
+                        to_eval.extend(x for x in kv if x is not None)
+            if beta_cross_attn_past_key_values is not None:
+                for kv in beta_cross_attn_past_key_values:
                     if kv is not None:
                         to_eval.extend(x for x in kv if x is not None)
             mx.eval(*to_eval)
@@ -754,6 +911,258 @@ class MusicGenGenerator:
             codes=codes if return_codes else None,
         )
 
+    def generate_extended(
+        self,
+        prompt: str,
+        duration: float,
+        extend_stride: int = 750,
+        window_length: int = 1500,
+        fade_duration: float = 0.5,
+        temperature: float = 1.0,
+        top_k: int = 250,
+        top_p: float = 0.0,
+        guidance_scale: float = 3.0,
+        use_sampling: bool = True,
+        seed: Optional[int] = None,
+        callback: Optional[Callable[[int, int, mx.array], None]] = None,
+    ) -> GenerationOutput:
+        """
+        Generate music longer than 30 seconds using extend_stride pattern.
+
+        Generates in overlapping windows with crossfade blending for seamless
+        long-form audio. Each window after the first reuses the end of the
+        previous window as context.
+
+        Args:
+            prompt: Text description of desired music
+            duration: Target duration in seconds (can exceed 30s)
+            extend_stride: Tokens to generate per extension (~15s = 750 at 50fps)
+            window_length: Max tokens per window (~30s = 1500 at 50fps)
+            fade_duration: Crossfade duration in seconds for blending
+            temperature: Sampling temperature
+            top_k: Top-k filtering
+            top_p: Nucleus sampling threshold
+            guidance_scale: Classifier-free guidance scale
+            use_sampling: If False, use greedy decoding
+            seed: Random seed for reproducibility
+            callback: Optional progress callback(step, total_steps, codes)
+
+        Returns:
+            GenerationOutput with seamlessly blended long audio
+        """
+        if seed is not None:
+            mx.random.seed(seed)
+
+        # Validate parameters
+        if duration <= 0:
+            raise ValueError(f"duration must be positive, got {duration}")
+        if extend_stride <= 0:
+            raise ValueError(f"extend_stride must be positive, got {extend_stride}")
+        if window_length <= extend_stride:
+            raise ValueError(
+                f"window_length ({window_length}) must be > extend_stride ({extend_stride})"
+            )
+
+        frame_rate = self.config.frame_rate
+        sample_rate = self.config.audio_encoder.sampling_rate
+        samples_per_frame = sample_rate // frame_rate  # typically 640 at 32kHz/50fps
+
+        # For short durations (<= 30s), just use regular generate
+        max_single_window = 30.0
+        if duration <= max_single_window:
+            return self.generate(
+                prompt=prompt,
+                duration=duration,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                guidance_scale=guidance_scale,
+                use_sampling=use_sampling,
+                seed=None,  # Already set above
+                callback=callback,
+            )
+
+        # Calculate total tokens needed
+        total_tokens = int(duration * frame_rate)
+        overlap_tokens = window_length - extend_stride
+        overlap_samples = overlap_tokens * samples_per_frame
+        fade_samples = int(fade_duration * sample_rate)
+
+        # Encode text prompt once (shared across all windows)
+        encoder_hidden_states, encoder_attention_mask = self.text_encoder.encode(prompt)
+
+        # For CFG
+        uncond_hidden_states = None
+        uncond_mask = None
+        if guidance_scale > 1.0:
+            uncond_hidden_states, uncond_mask = self.text_encoder.encode("")
+
+        # Initialize tracking
+        batch_size = 1
+        num_codebooks = self.config.decoder.num_codebooks
+        bos_token = self.config.decoder.bos_token_id
+
+        all_audio = None
+        tokens_generated = 0
+        window_idx = 0
+        total_callback_steps = total_tokens
+
+        while tokens_generated < total_tokens:
+            # Determine how many tokens to generate this window
+            remaining = total_tokens - tokens_generated
+
+            if window_idx == 0:
+                # First window: generate up to window_length tokens
+                window_tokens = min(window_length, remaining)
+                # Start with BOS
+                codes = mx.full((batch_size, num_codebooks, 1), bos_token, dtype=mx.int32)
+                # Fresh caches
+                past_key_values = None
+                cross_attn_past_key_values = None
+                uncond_past_key_values = None
+                uncond_cross_attn_past_key_values = None
+            else:
+                # Subsequent windows: keep overlap, generate extend_stride tokens
+                window_tokens = min(extend_stride, remaining)
+
+                # Get the last overlap_tokens from previous codes (without BOS)
+                # prev_codes is (batch, codebooks, seq) without BOS
+                overlap_codes = prev_codes[:, :, -overlap_tokens:]
+
+                # Prepend BOS and use as context
+                codes = mx.concatenate([
+                    mx.full((batch_size, num_codebooks, 1), bos_token, dtype=mx.int32),
+                    overlap_codes,
+                ], axis=-1)
+
+                mx.eval(codes)
+
+                # Build KV cache from overlap context
+                _, past_key_values, cross_attn_past_key_values = self.decoder(
+                    input_ids=codes,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    past_key_values=None,
+                    cross_attn_past_key_values=None,
+                    use_cache=True,
+                )
+
+                if guidance_scale > 1.0:
+                    _, uncond_past_key_values, uncond_cross_attn_past_key_values = self.decoder(
+                        input_ids=codes,
+                        encoder_hidden_states=uncond_hidden_states,
+                        encoder_attention_mask=uncond_mask,
+                        past_key_values=None,
+                        cross_attn_past_key_values=None,
+                        use_cache=True,
+                    )
+
+                # Evaluate caches
+                to_eval = []
+                for cache_list in [past_key_values, cross_attn_past_key_values,
+                                   uncond_past_key_values, uncond_cross_attn_past_key_values]:
+                    if cache_list is not None:
+                        for kv in cache_list:
+                            if kv is not None:
+                                to_eval.extend(x for x in kv if x is not None)
+                if to_eval:
+                    mx.eval(*to_eval)
+
+            # Generation loop for this window
+            for step in range(window_tokens):
+                # Conditional path
+                logits, past_key_values, cross_attn_past_key_values = self.decoder(
+                    input_ids=codes if past_key_values is None else codes[:, :, -1:],
+                    encoder_hidden_states=encoder_hidden_states if cross_attn_past_key_values is None else None,
+                    encoder_attention_mask=encoder_attention_mask,
+                    past_key_values=past_key_values,
+                    cross_attn_past_key_values=cross_attn_past_key_values,
+                    use_cache=True,
+                )
+
+                next_logits = logits[:, :, -1, :]
+
+                # CFG
+                if guidance_scale > 1.0:
+                    uncond_logits, uncond_past_key_values, uncond_cross_attn_past_key_values = self.decoder(
+                        input_ids=codes if uncond_past_key_values is None else codes[:, :, -1:],
+                        encoder_hidden_states=uncond_hidden_states if uncond_cross_attn_past_key_values is None else None,
+                        encoder_attention_mask=uncond_mask,
+                        past_key_values=uncond_past_key_values,
+                        cross_attn_past_key_values=uncond_cross_attn_past_key_values,
+                        use_cache=True,
+                    )
+                    uncond_next = uncond_logits[:, :, -1, :]
+                    next_logits = apply_classifier_free_guidance(
+                        next_logits, uncond_next, guidance_scale
+                    )
+
+                # Sample next tokens
+                next_tokens = []
+                for cb in range(num_codebooks):
+                    cb_logits = next_logits[:, cb, :]
+                    next_token = sample_next_token(cb_logits, temperature, top_k, top_p, use_sampling)
+                    next_tokens.append(next_token)
+
+                next_tokens = mx.stack(next_tokens, axis=1)
+                codes = mx.concatenate([codes, next_tokens], axis=-1)
+
+                # Evaluate to prevent memory buildup
+                to_eval = [codes]
+                for cache_list in [past_key_values, cross_attn_past_key_values,
+                                   uncond_past_key_values, uncond_cross_attn_past_key_values]:
+                    if cache_list is not None:
+                        for kv in cache_list:
+                            if kv is not None:
+                                to_eval.extend(x for x in kv if x is not None)
+                mx.eval(*to_eval)
+
+                # Callback with overall progress
+                if callback is not None:
+                    overall_step = tokens_generated + step
+                    callback(overall_step, total_callback_steps, codes)
+
+            # Remove BOS from this window's codes
+            window_codes = codes[:, :, 1:]  # (batch, codebooks, window_tokens + overlap if not first)
+
+            # Decode this window to audio
+            window_audio = self.encodec.decode(window_codes)
+            window_audio_np = np.array(window_audio)
+            if window_audio_np.ndim == 3:
+                window_audio_np = window_audio_np[0]  # (channels, samples)
+
+            # Blend with previous audio
+            if all_audio is None:
+                all_audio = window_audio_np
+            else:
+                # Subsequent windows include overlap from previous
+                all_audio = blend_overlapping_audio(
+                    all_audio, window_audio_np, overlap_samples, fade_samples
+                )
+
+            # Save codes for next window's context (without BOS)
+            prev_codes = window_codes
+
+            # Update tracking - count new tokens only (window_tokens excludes overlap)
+            tokens_generated += window_tokens
+            window_idx += 1
+
+            # Clear old caches to free memory
+            past_key_values = None
+            cross_attn_past_key_values = None
+            uncond_past_key_values = None
+            uncond_cross_attn_past_key_values = None
+
+        # Calculate actual duration from audio length
+        actual_duration = all_audio.shape[-1] / sample_rate
+
+        return GenerationOutput(
+            audio=all_audio,
+            sample_rate=sample_rate,
+            duration=actual_duration,
+            codes=None,  # Not meaningful for extended generation
+        )
+
 
 __all__ = [
     "GenerationConfig",
@@ -762,5 +1171,6 @@ __all__ = [
     "top_p_filtering",
     "sample_next_token",
     "apply_classifier_free_guidance",
+    "blend_overlapping_audio",
     "MusicGenGenerator",
 ]

@@ -5,7 +5,7 @@ High-level interface for loading and generating music with MusicGen.
 """
 
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import mlx.core as mx
 import numpy as np
@@ -170,32 +170,36 @@ class MusicGen:
 
     def generate(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         duration: float = 10.0,
         temperature: float = 1.0,
         top_k: int = 250,
         top_p: float = 0.0,
         guidance_scale: float = 3.0,
+        use_sampling: bool = True,
         seed: Optional[int] = None,
         callback: Optional[Callable[[int, int, mx.array], None]] = None,
         return_codes: bool = False,
-    ) -> GenerationOutput:
+    ) -> Union[GenerationOutput, List[GenerationOutput]]:
         """
-        Generate music from text prompt.
+        Generate music from text prompt(s).
+
+        Supports batch generation when prompt is a list.
 
         Args:
-            prompt: Text description of desired music
+            prompt: Text description(s) of desired music (str or list of str)
             duration: Target duration in seconds (max 30s recommended)
             temperature: Sampling temperature (higher = more random)
             top_k: Top-k filtering (higher = more diverse)
             top_p: Nucleus sampling threshold (0.0 = disabled)
             guidance_scale: Classifier-free guidance scale
+            use_sampling: If False, use greedy decoding (deterministic)
             seed: Random seed for reproducibility
             callback: Optional progress callback(step, total_steps, codes)
             return_codes: Whether to return raw audio codes
 
         Returns:
-            GenerationOutput with audio and metadata
+            GenerationOutput (single) or List[GenerationOutput] (batch)
         """
         if self.text_encoder is None:
             raise RuntimeError(
@@ -220,6 +224,7 @@ class MusicGen:
             top_k=top_k,
             top_p=top_p,
             guidance_scale=guidance_scale,
+            use_sampling=use_sampling,
             seed=seed,
             callback=callback,
             return_codes=return_codes,
@@ -234,6 +239,8 @@ class MusicGen:
         top_k: int = 250,
         top_p: float = 0.0,
         guidance_scale: float = 3.0,
+        guidance_scale_beta: float = 0.0,
+        use_sampling: bool = True,
         seed: Optional[int] = None,
         callback: Optional[Callable[[int, int, mx.array], None]] = None,
         return_codes: bool = False,
@@ -244,6 +251,10 @@ class MusicGen:
         Only available for MusicGen-Melody variant. The melody from the reference
         audio guides the generation while the text prompt controls style/instrumentation.
 
+        Supports double CFG when guidance_scale_beta > 0:
+        - Primary: text+melody vs unconditional (controlled by guidance_scale)
+        - Secondary: text-only vs unconditional (controlled by guidance_scale_beta)
+
         Args:
             prompt: Text description of desired style/instrumentation
             melody_audio: Reference audio for melody extraction (samples,) or (channels, samples)
@@ -251,7 +262,9 @@ class MusicGen:
             temperature: Sampling temperature (higher = more random)
             top_k: Top-k filtering (higher = more diverse)
             top_p: Nucleus sampling threshold (0.0 = disabled)
-            guidance_scale: Classifier-free guidance scale
+            guidance_scale: Primary CFG scale (text+melody vs unconditional)
+            guidance_scale_beta: Secondary CFG scale (text-only vs unconditional), 0 = disabled
+            use_sampling: If False, use greedy decoding (deterministic)
             seed: Random seed for reproducibility
             callback: Optional progress callback(step, total_steps, codes)
             return_codes: Whether to return raw audio codes
@@ -283,6 +296,8 @@ class MusicGen:
             top_k=top_k,
             top_p=top_p,
             guidance_scale=guidance_scale,
+            guidance_scale_beta=guidance_scale_beta,
+            use_sampling=use_sampling,
             seed=seed,
             callback=callback,
             return_codes=return_codes,
@@ -297,6 +312,7 @@ class MusicGen:
         top_k: int = 250,
         top_p: float = 0.0,
         guidance_scale: float = 3.0,
+        use_sampling: bool = True,
         seed: Optional[int] = None,
         callback: Optional[Callable[[int, int, mx.array], None]] = None,
         return_codes: bool = False,
@@ -315,6 +331,7 @@ class MusicGen:
             top_k: Top-k filtering (higher = more diverse)
             top_p: Nucleus sampling threshold (0.0 = disabled)
             guidance_scale: Classifier-free guidance scale
+            use_sampling: If False, use greedy decoding (deterministic)
             seed: Random seed for reproducibility
             callback: Optional progress callback(step, total_steps, codes)
             return_codes: Whether to return raw audio codes
@@ -336,9 +353,79 @@ class MusicGen:
             top_k=top_k,
             top_p=top_p,
             guidance_scale=guidance_scale,
+            use_sampling=use_sampling,
             seed=seed,
             callback=callback,
             return_codes=return_codes,
+        )
+
+    def generate_extended(
+        self,
+        prompt: str,
+        duration: float,
+        extend_stride: int = 750,
+        window_length: int = 1500,
+        fade_duration: float = 0.5,
+        temperature: float = 1.0,
+        top_k: int = 250,
+        top_p: float = 0.0,
+        guidance_scale: float = 3.0,
+        use_sampling: bool = True,
+        seed: Optional[int] = None,
+        callback: Optional[Callable[[int, int, mx.array], None]] = None,
+    ) -> GenerationOutput:
+        """
+        Generate music longer than 30 seconds using extend_stride pattern.
+
+        Generates in overlapping windows with crossfade blending for seamless
+        long-form audio. Each window after the first reuses the end of the
+        previous window as context.
+
+        Args:
+            prompt: Text description of desired music
+            duration: Target duration in seconds (can exceed 30s)
+            extend_stride: Tokens to generate per extension (~15s = 750 at 50fps)
+            window_length: Max tokens per window (~30s = 1500 at 50fps)
+            fade_duration: Crossfade duration in seconds for blending
+            temperature: Sampling temperature (higher = more random)
+            top_k: Top-k filtering (higher = more diverse)
+            top_p: Nucleus sampling threshold (0.0 = disabled)
+            guidance_scale: Classifier-free guidance scale
+            use_sampling: If False, use greedy decoding (deterministic)
+            seed: Random seed for reproducibility
+            callback: Optional progress callback(step, total_steps, codes)
+
+        Returns:
+            GenerationOutput with seamlessly blended long audio
+
+        Example:
+            >>> output = model.generate_extended(
+            ...     prompt="jazz piano improvisation",
+            ...     duration=60.0,  # 1 minute
+            ... )
+            >>> # Audio is seamlessly blended from multiple windows
+        """
+        if self.text_encoder is None:
+            raise RuntimeError(
+                "Text encoder not loaded. Load with load_text_encoder=True"
+            )
+
+        if self.encodec is None:
+            raise RuntimeError("EnCodec not loaded. Load with load_encodec=True")
+
+        return self.generator.generate_extended(
+            prompt=prompt,
+            duration=duration,
+            extend_stride=extend_stride,
+            window_length=window_length,
+            fade_duration=fade_duration,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            guidance_scale=guidance_scale,
+            use_sampling=use_sampling,
+            seed=seed,
+            callback=callback,
         )
 
     def __repr__(self) -> str:
