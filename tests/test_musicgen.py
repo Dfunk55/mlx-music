@@ -323,6 +323,63 @@ class TestMusicGenCodecs:
         assert audio.shape[1] == 1  # mono channel
         assert audio.shape[2] == 32000  # 50 frames * 640 = 32000 samples = 1 sec at 32kHz
 
+    def test_placeholder_encodec_stereo(self):
+        """Test placeholder EnCodec returns correct stereo shapes."""
+        from mlx_music.codecs import PlaceholderEnCodec
+
+        codec = PlaceholderEnCodec(num_codebooks=4, sample_rate=32000, audio_channels=2)
+
+        # Test decode
+        codes = mx.zeros((1, 4, 50), dtype=mx.int32)
+        audio = codec.decode(codes)
+
+        # Shape is (batch, channels, samples)
+        assert audio.shape[0] == 1  # batch
+        assert audio.shape[1] == 2  # stereo channels
+        assert audio.shape[2] == 32000
+
+        # Verify audio_channels property
+        assert codec.audio_channels == 2
+
+    def test_placeholder_encodec_stereo_from_model_id(self):
+        """Test that stereo is auto-detected from model name."""
+        from mlx_music.codecs import PlaceholderEnCodec
+
+        # Test stereo model name detection
+        codec = PlaceholderEnCodec.from_pretrained("facebook/musicgen-stereo-small")
+        assert codec.audio_channels == 2
+
+        # Test mono model name (should stay mono)
+        codec_mono = PlaceholderEnCodec.from_pretrained("facebook/musicgen-small")
+        assert codec_mono.audio_channels == 1
+
+    def test_get_encodec_stereo(self):
+        """Test get_encodec returns stereo codec with correct channels."""
+        from mlx_music.codecs import get_encodec
+
+        # Force placeholder to test stereo support
+        codec = get_encodec(
+            model_id="facebook/encodec_32khz",
+            use_placeholder=True,
+            audio_channels=2,
+        )
+        assert codec.audio_channels == 2
+
+        codes = mx.zeros((1, 4, 50), dtype=mx.int32)
+        audio = codec.decode(codes)
+        assert audio.shape[1] == 2  # stereo
+
+    def test_get_encodec_stereo_auto_detect(self):
+        """Test get_encodec auto-detects stereo from model name."""
+        from mlx_music.codecs import get_encodec
+
+        # Should auto-detect stereo from model name
+        codec = get_encodec(
+            model_id="facebook/musicgen-stereo-medium",
+            use_placeholder=True,
+        )
+        assert codec.audio_channels == 2
+
 
 @pytest.mark.skipif(
     not Path(MUSICGEN_SMALL_PATH).exists(),

@@ -139,11 +139,16 @@ class MusicGen:
             try:
                 from mlx_music.codecs import get_encodec
 
+                # Get audio_channels from config (2 for stereo models)
+                audio_channels = config.decoder.audio_channels
+
                 encodec = get_encodec(
                     model_id="facebook/encodec_32khz",
                     dtype=dtype,
+                    audio_channels=audio_channels,
                 )
-                print("EnCodec loaded successfully!")
+                channels_str = "stereo" if audio_channels == 2 else "mono"
+                print(f"EnCodec loaded successfully! ({channels_str})")
             except Exception as e:
                 print(f"Warning: Could not load EnCodec: {e}")
                 print("Audio decoding will use placeholder (silence)")
@@ -428,7 +433,18 @@ class MusicGen:
             callback=callback,
         )
 
+    @property
+    def is_stereo(self) -> bool:
+        """Check if this is a stereo model."""
+        return self.config.decoder.audio_channels == 2
+
+    @property
+    def audio_channels(self) -> int:
+        """Get the number of audio channels (1=mono, 2=stereo)."""
+        return self.config.decoder.audio_channels
+
     def __repr__(self) -> str:
+        audio_mode = "stereo" if self.is_stereo else "mono"
         return (
             f"MusicGen(\n"
             f"  model_type={self.config.model_type},\n"
@@ -436,6 +452,7 @@ class MusicGen:
             f"  num_layers={self.config.num_hidden_layers},\n"
             f"  num_heads={self.config.num_attention_heads},\n"
             f"  num_codebooks={self.config.num_codebooks},\n"
+            f"  audio_channels={self.audio_channels} ({audio_mode}),\n"
             f"  dtype={self.dtype},\n"
             f"  has_text_encoder={self.text_encoder is not None},\n"
             f"  has_encodec={self.encodec is not None},\n"

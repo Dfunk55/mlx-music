@@ -14,6 +14,7 @@ import mlx.nn as nn
 import numpy as np
 
 from mlx_music.models.ace_step.dcae import DCAE, DCAEConfig
+from mlx_music.models.ace_step.lyric_tokenizer import VoiceBpeTokenizer
 from mlx_music.models.ace_step.scheduler import (
     FlowMatchEulerDiscreteScheduler,
     get_scheduler,
@@ -85,12 +86,14 @@ class ACEStep:
         config: ACEStepConfig,
         text_encoder: Optional[Any] = None,
         audio_pipeline: Optional[MusicDCAEPipeline] = None,
+        lyric_tokenizer: Optional[VoiceBpeTokenizer] = None,
         dtype: mx.Dtype = mx.bfloat16,
     ):
         self.transformer = transformer
         self.config = config
         self.text_encoder = text_encoder
         self.audio_pipeline = audio_pipeline
+        self.lyric_tokenizer = lyric_tokenizer
         self.dtype = dtype
 
         # Default scheduler
@@ -190,11 +193,22 @@ class ACEStep:
                 print(f"Warning: Could not load audio pipeline: {e}")
                 print("Audio decoding will use placeholder (silence)")
 
+        # Load lyric tokenizer
+        lyric_tokenizer = None
+        print("Loading lyric tokenizer...")
+        try:
+            lyric_tokenizer = VoiceBpeTokenizer()
+            print(f"Lyric tokenizer loaded ({len(lyric_tokenizer)} tokens)")
+        except Exception as e:
+            print(f"Warning: Could not load lyric tokenizer: {e}")
+            print("Lyric encoding will use placeholder tokens")
+
         return cls(
             transformer=transformer,
             config=config,
             text_encoder=text_encoder,
             audio_pipeline=audio_pipeline,
+            lyric_tokenizer=lyric_tokenizer,
             dtype=dtype,
         )
 
@@ -229,20 +243,50 @@ class ACEStep:
     def encode_lyrics(
         self,
         lyrics: str,
+        lang: str = "en",
+        max_length: int = 512,
     ) -> Tuple[mx.array, mx.array]:
         """
         Encode lyrics to token indices.
 
         Args:
             lyrics: Lyrics text
+            lang: Language code (en, zh, ko, etc.)
+            max_length: Maximum token length (will pad/truncate)
 
         Returns:
             Tuple of (token_indices, attention_mask)
         """
-        # Placeholder - return dummy tokens
-        # In real implementation, use VoiceBpeTokenizer
-        tokens = mx.zeros((1, 128), dtype=mx.int32)
-        mask = mx.ones((1, 128))
+        if self.lyric_tokenizer is None:
+            # Return placeholder tokens if tokenizer not available
+            # Mask is all zeros to indicate no valid tokens
+            tokens = mx.zeros((1, max_length), dtype=mx.int32)
+            mask = mx.zeros((1, max_length))
+            return tokens, mask
+
+        # Tokenize lyrics
+        token_ids = self.lyric_tokenizer.encode(lyrics, lang=lang)
+
+        # Pad or truncate to max_length
+        if len(token_ids) > max_length:
+            print(
+                f"Warning: Lyrics truncated from {len(token_ids)} to {max_length} tokens. "
+                "Some lyrics may not be included in generation."
+            )
+            token_ids = token_ids[:max_length]
+            actual_length = max_length
+        else:
+            actual_length = len(token_ids)
+            # Pad with zeros
+            token_ids = token_ids + [0] * (max_length - len(token_ids))
+
+        # Create attention mask (1 for real tokens, 0 for padding)
+        mask = [1.0] * actual_length + [0.0] * (max_length - actual_length)
+
+        # Convert to MLX arrays
+        tokens = mx.array([token_ids], dtype=mx.int32)
+        mask = mx.array([mask])
+
         return tokens, mask
 
     def decode_latents(
@@ -451,5 +495,6 @@ class ACEStep:
             f"  dtype={self.dtype},\n"
             f"  has_text_encoder={self.text_encoder is not None},\n"
             f"  has_audio_pipeline={self.audio_pipeline is not None},\n"
+            f"  has_lyric_tokenizer={self.lyric_tokenizer is not None},\n"
             f")"
         )

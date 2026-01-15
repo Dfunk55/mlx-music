@@ -12,6 +12,7 @@ Architecture:
 """
 
 from mlx_music.models.ace_step.dcae import DCAE, DCAEConfig
+from mlx_music.models.ace_step.lyric_tokenizer import VoiceBpeTokenizer, get_tokenizer
 from mlx_music.models.ace_step.model import ACEStep, GenerationConfig, GenerationOutput
 from mlx_music.models.ace_step.scheduler import (
     FlowMatchEulerDiscreteScheduler,
@@ -40,5 +41,7 @@ __all__ = [
     "PlaceholderTextEncoder",
     "UMT5TextEncoder",
     "VocoderConfig",
+    "VoiceBpeTokenizer",
     "get_text_encoder",
+    "get_tokenizer",
 ]

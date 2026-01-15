@@ -88,7 +88,7 @@ class EnCodecWrapper:
                     # If it's a list of tuples or other format
                     new_weights = [(k, v.astype(dtype)) for k, v in params]
                 model.load_weights(new_weights)
-            except Exception as e:
+            except (AttributeError, TypeError, ValueError, RuntimeError) as e:
                 print(f"Warning: Could not convert EnCodec to {dtype}: {e}")
 
         return cls(model, processor)
@@ -161,6 +161,12 @@ class EnCodecWrapper:
         hop_length = math.prod(self.model.config.upsampling_ratios)
         return self.model.config.sampling_rate // hop_length
 
+    @property
+    def audio_channels(self) -> int:
+        """Get the number of audio channels (1=mono, 2=stereo)."""
+        # Read from model config if available, default to 1 (mono)
+        return getattr(self.model.config, "audio_channels", 1)
+
 
 class PlaceholderEnCodec:
     """
@@ -170,18 +176,42 @@ class PlaceholderEnCodec:
     Used for testing model loading without full audio pipeline.
     """
 
-    def __init__(self, sample_rate: int = 32000, num_codebooks: int = 4):
+    # Hop length = sample_rate / frame_rate = 32000 / 50 = 640
+    # This matches EnCodec's upsampling ratios: 8 * 5 * 4 * 4 = 640
+    HOP_LENGTH = 640
+    DEFAULT_FRAME_RATE = 50
+
+    def __init__(
+        self,
+        sample_rate: int = 32000,
+        num_codebooks: int = 4,
+        audio_channels: int = 1,
+    ):
         self._sample_rate = sample_rate
         self._num_codebooks = num_codebooks
+        self._audio_channels = audio_channels
 
     @classmethod
     def from_pretrained(
         cls,
         model_id: str = "facebook/encodec_32khz",
         dtype: mx.Dtype = mx.float32,
+        audio_channels: int = 1,
     ) -> "PlaceholderEnCodec":
-        """Create placeholder instance (ignores model_id)."""
-        return cls()
+        """Create placeholder instance.
+
+        Args:
+            model_id: Model ID (used to detect stereo from model name)
+            dtype: Data type (ignored for placeholder)
+            audio_channels: Number of audio channels (1=mono, 2=stereo)
+
+        Returns:
+            PlaceholderEnCodec instance
+        """
+        # Auto-detect stereo from model name if not specified
+        if audio_channels == 1 and "stereo" in model_id.lower():
+            audio_channels = 2
+        return cls(audio_channels=audio_channels)
 
     def encode(
         self,
@@ -194,7 +224,7 @@ class PlaceholderEnCodec:
 
         batch_size = audio.shape[0]
         num_samples = audio.shape[-1]
-        num_frames = num_samples // 640  # Approximate frame rate
+        num_frames = num_samples // self.HOP_LENGTH
 
         codes = mx.zeros((batch_size, self._num_codebooks, num_frames), dtype=mx.int32)
         return codes, None
@@ -204,12 +234,14 @@ class PlaceholderEnCodec:
         codes: mx.array,
         scales: Optional[mx.array] = None,
     ) -> mx.array:
-        """Return silent audio."""
+        """Return silent audio with correct number of channels."""
         batch_size = codes.shape[0]
         num_frames = codes.shape[-1]
-        num_samples = num_frames * 640
+        num_samples = num_frames * self.HOP_LENGTH
 
-        return mx.zeros((batch_size, 1, num_samples), dtype=mx.float32)
+        return mx.zeros(
+            (batch_size, self._audio_channels, num_samples), dtype=mx.float32
+        )
 
     @property
     def sample_rate(self) -> int:
@@ -220,14 +252,19 @@ class PlaceholderEnCodec:
         return self._num_codebooks
 
     @property
+    def audio_channels(self) -> int:
+        return self._audio_channels
+
+    @property
     def frame_rate(self) -> int:
-        return 50  # 32000 / 640
+        return self.DEFAULT_FRAME_RATE  # 32000 / 640 = 50
 
 
 def get_encodec(
     model_id: str = "facebook/encodec_32khz",
     dtype: mx.Dtype = mx.float32,
     use_placeholder: bool = False,
+    audio_channels: int = 1,
 ) -> "EnCodecWrapper | PlaceholderEnCodec":
     """
     Get EnCodec model, with fallback to placeholder.
@@ -236,17 +273,23 @@ def get_encodec(
         model_id: HuggingFace model ID
         dtype: Data type for model weights
         use_placeholder: Force use of placeholder
+        audio_channels: Number of audio channels (1=mono, 2=stereo)
+            Auto-detected from model_id if "stereo" is in the name.
 
     Returns:
         EnCodecWrapper or PlaceholderEnCodec
     """
+    # Auto-detect stereo from model name
+    if audio_channels == 1 and "stereo" in model_id.lower():
+        audio_channels = 2
+
     if use_placeholder or not _check_encodec_available():
         if not use_placeholder:
             print(
                 "Warning: mlx-audio not available, using placeholder EnCodec. "
                 "Install with: pip install mlx-audio"
             )
-        return PlaceholderEnCodec.from_pretrained(model_id, dtype)
+        return PlaceholderEnCodec.from_pretrained(model_id, dtype, audio_channels)
 
     return EnCodecWrapper.from_pretrained(model_id, dtype)
 
