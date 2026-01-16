@@ -5,9 +5,12 @@ Provides wrappers around mlx-audio codec implementations.
 Currently supports EnCodec for MusicGen compatibility.
 """
 
+import logging
 from typing import Optional, Tuple
 
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
 
 # Lazy import flag
 _encodec_available = None
@@ -89,7 +92,7 @@ class EnCodecWrapper:
                     new_weights = [(k, v.astype(dtype)) for k, v in params]
                 model.load_weights(new_weights)
             except (AttributeError, TypeError, ValueError, RuntimeError) as e:
-                print(f"Warning: Could not convert EnCodec to {dtype}: {e}")
+                logger.warning(f"Could not convert EnCodec to {dtype}: {e}")
 
         return cls(model, processor)
 
@@ -285,8 +288,8 @@ def get_encodec(
 
     if use_placeholder or not _check_encodec_available():
         if not use_placeholder:
-            print(
-                "Warning: mlx-audio not available, using placeholder EnCodec. "
+            logger.warning(
+                "mlx-audio not available, using placeholder EnCodec. "
                 "Install with: pip install mlx-audio"
             )
         return PlaceholderEnCodec.from_pretrained(model_id, dtype, audio_channels)

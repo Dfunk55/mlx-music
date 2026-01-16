@@ -20,9 +20,12 @@ LOG_PROMPT_MAX_LENGTH = 50  # Maximum prompt length to show in logs
 # Model-specific default values
 ACE_STEP_DEFAULT_STEPS = 60
 ACE_STEP_DEFAULT_GUIDANCE = 15.0
+ACE_STEP_DEFAULT_MODEL = "ACE-Step/ACE-Step-v1-3.5B"
 MUSICGEN_DEFAULT_GUIDANCE = 3.0
+MUSICGEN_DEFAULT_MODEL = "facebook/musicgen-small"
 STABLE_AUDIO_DEFAULT_STEPS = 100
 STABLE_AUDIO_DEFAULT_GUIDANCE = 7.0
+STABLE_AUDIO_DEFAULT_MODEL = "stabilityai/stable-audio-open-1.0"
 
 
 def detect_model_family(model_path: str) -> str:
@@ -136,8 +139,8 @@ Examples:
     gen_parser.add_argument(
         "--model",
         type=str,
-        default="ACE-Step/ACE-Step-v1-3.5B",
-        help="Model path or HuggingFace repo ID",
+        default=None,
+        help="Model path or HuggingFace repo ID (default: engine-specific)",
     )
     gen_parser.add_argument(
         "--prompt",
@@ -216,6 +219,23 @@ Examples:
         generate_command(args)
 
 
+def get_default_model(engine: str) -> str:
+    """Get the default model ID for an engine.
+
+    Args:
+        engine: Model family ("ace-step", "musicgen", "stable-audio")
+
+    Returns:
+        Default HuggingFace model ID for the engine
+    """
+    defaults = {
+        "ace-step": ACE_STEP_DEFAULT_MODEL,
+        "musicgen": MUSICGEN_DEFAULT_MODEL,
+        "stable-audio": STABLE_AUDIO_DEFAULT_MODEL,
+    }
+    return defaults.get(engine, ACE_STEP_DEFAULT_MODEL)
+
+
 def generate_command(args) -> None:
     """Handle generate command."""
     from mlx_music.utils.audio_io import save_audio
@@ -223,8 +243,26 @@ def generate_command(args) -> None:
     # Validate arguments
     validate_args(args)
 
-    # Auto-detect model family if not specified
-    engine = args.engine or detect_model_family(args.model)
+    # Determine engine and model
+    if args.engine and args.model:
+        # Both specified - use as-is
+        engine = args.engine
+        model = args.model
+    elif args.engine:
+        # Engine specified, auto-select default model
+        engine = args.engine
+        model = get_default_model(engine)
+    elif args.model:
+        # Model specified, auto-detect engine
+        engine = detect_model_family(args.model)
+        model = args.model
+    else:
+        # Neither specified - default to ace-step
+        engine = "ace-step"
+        model = get_default_model(engine)
+
+    # Update args with resolved model
+    args.model = model
 
     # Warn about incompatible parameter combinations
     if args.lyrics and engine != "ace-step":
@@ -345,7 +383,7 @@ def _generate_musicgen(args) -> None:
         pbar = tqdm(total=total_steps, desc="Generating")
 
         def callback(step, total, codes):
-            pbar.n = step
+            pbar.n = step + 1  # step is 0-indexed, display as 1-indexed
             pbar.refresh()
 
         try:

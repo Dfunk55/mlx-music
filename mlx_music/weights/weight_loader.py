@@ -7,6 +7,7 @@ converting from PyTorch format to MLX format.
 
 import gc
 import json
+import logging
 import os
 import re
 import threading
@@ -25,6 +26,8 @@ from huggingface_hub import snapshot_download
 from huggingface_hub.utils import LocalEntryNotFoundError, EntryNotFoundError
 from safetensors import safe_open
 from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 class PathTraversalError(ValueError):
@@ -368,7 +371,7 @@ def load_sharded_safetensors(
             needed_shards.append(safe_path)
 
         if skipped_shards and show_progress:
-            print(f"Skipping {len(skipped_shards)} shards (no matching keys)")
+            logger.debug(f"Skipping {len(skipped_shards)} shards (no matching keys)")
 
         shard_files = needed_shards
     else:
@@ -721,7 +724,7 @@ def load_sharded_pytorch(
         )
 
     if skipped_shards and show_progress:
-        print(f"Skipping {len(skipped_shards)} shards (no matching keys)")
+        logger.debug(f"Skipping {len(skipped_shards)} shards (no matching keys)")
 
     # Load shards (parallel or sequential)
     weights = {}
@@ -868,7 +871,7 @@ def download_model(
         return model_path
 
     # Download from HuggingFace Hub
-    print(f"Downloading model from HuggingFace Hub: {model_id}...")
+    logger.info(f"Downloading model from HuggingFace Hub: {model_id}...")
 
     try:
         # Try offline first (cached models)
@@ -878,7 +881,7 @@ def download_model(
             revision=revision,
             local_files_only=True,
         ))
-        print("Using cached model.")
+        logger.info("Using cached model.")
     except (LocalEntryNotFoundError, EntryNotFoundError, OSError):
         # Model not cached locally, fall back to network download
         # OSError can occur for network issues or missing cache
@@ -887,7 +890,7 @@ def download_model(
             local_dir=str(local_dir) if local_dir else None,
             revision=revision,
         ))
-        print("Download complete.")
+        logger.info("Download complete.")
 
     return model_path
 

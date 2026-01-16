@@ -5,6 +5,7 @@ Provides a high-level interface for loading and generating
 music with the ACE-Step model.
 """
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -12,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from mlx_music.models.ace_step.dcae import DCAE, DCAEConfig
 from mlx_music.models.ace_step.lyric_tokenizer import VoiceBpeTokenizer
@@ -131,7 +134,7 @@ class ACEStep:
         model_path = download_model(str(model_path))
 
         # Load transformer weights and config
-        print("Loading transformer...")
+        logger.info("Loading transformer...")
         weights, config_dict = load_ace_step_weights(
             model_path, component="transformer", dtype=dtype
         )
@@ -150,7 +153,7 @@ class ACEStep:
         audio_pipeline = None
 
         if load_text_encoder:
-            print("Loading text encoder (UMT5)...")
+            logger.info("Loading text encoder (UMT5)...")
             try:
                 # Determine device for PyTorch encoder
                 import platform
@@ -179,29 +182,29 @@ class ACEStep:
                     device=device,
                     use_fp16=(dtype == mx.float16),
                 )
-                print(f"Text encoder loaded successfully on {device}!")
+                logger.info(f"Text encoder loaded successfully on {device}!")
             except Exception as e:
-                print(f"Warning: Could not load text encoder: {e}")
-                print("Using placeholder encoder (generation will have limited quality)")
+                logger.warning(f"Could not load text encoder: {e}")
+                logger.warning("Using placeholder encoder (generation will have limited quality)")
 
         if load_audio_pipeline:
-            print("Loading audio pipeline (DCAE + vocoder)...")
+            logger.info("Loading audio pipeline (DCAE + vocoder)...")
             try:
                 audio_pipeline = MusicDCAEPipeline.from_pretrained(str(model_path), dtype=dtype)
-                print("Audio pipeline loaded successfully!")
+                logger.info("Audio pipeline loaded successfully!")
             except Exception as e:
-                print(f"Warning: Could not load audio pipeline: {e}")
-                print("Audio decoding will use placeholder (silence)")
+                logger.warning(f"Could not load audio pipeline: {e}")
+                logger.warning("Audio decoding will use placeholder (silence)")
 
         # Load lyric tokenizer
         lyric_tokenizer = None
-        print("Loading lyric tokenizer...")
+        logger.info("Loading lyric tokenizer...")
         try:
             lyric_tokenizer = VoiceBpeTokenizer()
-            print(f"Lyric tokenizer loaded ({len(lyric_tokenizer)} tokens)")
+            logger.info(f"Lyric tokenizer loaded ({len(lyric_tokenizer)} tokens)")
         except Exception as e:
-            print(f"Warning: Could not load lyric tokenizer: {e}")
-            print("Lyric encoding will use placeholder tokens")
+            logger.warning(f"Could not load lyric tokenizer: {e}")
+            logger.warning("Lyric encoding will use placeholder tokens")
 
         return cls(
             transformer=transformer,
@@ -269,8 +272,8 @@ class ACEStep:
 
         # Pad or truncate to max_length
         if len(token_ids) > max_length:
-            print(
-                f"Warning: Lyrics truncated from {len(token_ids)} to {max_length} tokens. "
+            logger.warning(
+                f"Lyrics truncated from {len(token_ids)} to {max_length} tokens. "
                 "Some lyrics may not be included in generation."
             )
             token_ids = token_ids[:max_length]

@@ -9,10 +9,13 @@ Simplified port from ACE-Step that supports:
 The tokenizer uses a BPE vocabulary trained for multilingual lyrics.
 """
 
+import logging
 import os
 import re
 from pathlib import Path
 from typing import List, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 # Optional imports for advanced language support
 try:
@@ -314,8 +317,8 @@ class VoiceBpeTokenizer:
         lang = lang.split("-")[0]  # Remove region code
         limit = self.char_limits.get(lang, 250)
         if len(txt) > limit:
-            print(
-                f"Warning: Text length ({len(txt)}) exceeds recommended limit "
+            logger.warning(
+                f"Text length ({len(txt)}) exceeds recommended limit "
                 f"({limit}) for language '{lang}'. This might cause truncation."
             )
 

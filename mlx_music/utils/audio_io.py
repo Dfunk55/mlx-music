@@ -1,9 +1,12 @@
 """Audio I/O utilities for mlx-music."""
 
+import logging
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def load_audio(
@@ -42,7 +45,7 @@ def load_audio(
             audio = resampy.resample(audio, sr, sample_rate, axis=1)
             sr = sample_rate
         except ImportError:
-            print(f"Warning: resampy not installed, keeping original sample rate {sr}")
+            logger.warning(f"resampy not installed, keeping original sample rate {sr}")
 
     return audio, sr
 
@@ -73,4 +76,4 @@ def save_audio(
             audio = audio.T  # (samples, channels)
 
     sf.write(str(path), audio, sample_rate)
-    print(f"Saved audio to {path}")
+    logger.info(f"Saved audio to {path}")

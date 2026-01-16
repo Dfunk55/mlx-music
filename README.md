@@ -22,8 +22,27 @@ This library is under active development with three model families supported.
 # From source (recommended during development)
 git clone https://github.com/Dfunk55/mlx-music.git
 cd mlx-music
-pip install -e ".[dev]"
+
+# Full features (recommended) - includes text encoding and audio codecs
+pip install -e ".[all]"
+
+# Or minimal install with specific features:
+pip install -e ".[text-encoder,codecs]"  # Text conditioning + audio decoding
+pip install -e ".[text-encoder]"          # Text conditioning only
+pip install -e ".[dev]"                   # Development dependencies
 ```
+
+### Optional Dependencies
+
+| Extra | Purpose | Required For |
+|-------|---------|--------------|
+| `text-encoder` | PyTorch + Transformers for T5/UMT5 | Text-conditioned generation |
+| `codecs` | mlx-audio for EnCodec | MusicGen audio decoding |
+| `lyrics` | Lyric processing libraries | ACE-Step lyrics support |
+| `all` | All of the above + dev tools | Full functionality |
+
+> **Note**: Without `text-encoder`, models fall back to unconditional generation.
+> Without `codecs`, MusicGen outputs silence (placeholder codec).
 
 ## Quick Start
 

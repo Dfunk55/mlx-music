@@ -88,6 +88,7 @@ class MusicGen:
         dtype: mx.Dtype = mx.float32,
         load_text_encoder: bool = True,
         load_encodec: bool = True,
+        strict_components: bool = True,
     ) -> "MusicGen":
         """
         Load MusicGen from pretrained weights.
@@ -102,9 +103,14 @@ class MusicGen:
             dtype: Data type for model weights
             load_text_encoder: Whether to load T5 text encoder
             load_encodec: Whether to load EnCodec for audio decoding
+            strict_components: If True (default), raise error if text encoder
+                or EnCodec fails to load. If False, fall back to placeholders.
 
         Returns:
             MusicGen instance
+
+        Raises:
+            RuntimeError: If strict_components=True and components fail to load
         """
         from mlx_music.weights.weight_loader import download_model
 
@@ -126,6 +132,7 @@ class MusicGen:
 
         # Load text encoder
         text_encoder = None
+        text_encoder_failed = False
         if load_text_encoder:
             logger.info("Loading text encoder (T5)...")
             try:
@@ -133,17 +140,41 @@ class MusicGen:
                     model_path=model_path,
                     use_fp16=(dtype == mx.float16),
                 )
-                logger.info("Text encoder loaded successfully!")
+                # Check if we got a placeholder
+                from .conditioning import PlaceholderTextEncoder
+                if isinstance(text_encoder, PlaceholderTextEncoder):
+                    text_encoder_failed = True
+                    if strict_components:
+                        raise RuntimeError(
+                            "Text encoder failed to load (got placeholder). "
+                            "Install with: pip install 'mlx-music[text-encoder]' "
+                            "or use strict_components=False to allow placeholder."
+                        )
+                    logger.warning("Using placeholder encoder (generation will have limited quality)")
+                else:
+                    logger.info("Text encoder loaded successfully!")
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except RuntimeError:
+                # Re-raise RuntimeError from strict_components check
+                raise
             except Exception as e:
+                text_encoder_failed = True
+                if strict_components:
+                    raise RuntimeError(
+                        f"Text encoder failed to load: {e}. "
+                        "Use strict_components=False to allow placeholder."
+                    ) from e
                 logger.warning(f"Could not load text encoder: {e}")
                 logger.warning("Using placeholder encoder (generation will have limited quality)")
 
         # Load EnCodec
         encodec = None
+        encodec_failed = False
         if load_encodec:
             logger.info("Loading EnCodec audio codec...")
             try:
-                from mlx_music.codecs import get_encodec
+                from mlx_music.codecs import get_encodec, PlaceholderEnCodec
 
                 # Get audio_channels from config (2 for stereo models)
                 audio_channels = config.decoder.audio_channels
@@ -153,9 +184,31 @@ class MusicGen:
                     dtype=dtype,
                     audio_channels=audio_channels,
                 )
-                channels_str = "stereo" if audio_channels == 2 else "mono"
-                logger.info(f"EnCodec loaded successfully! ({channels_str})")
+                # Check if we got a placeholder
+                if isinstance(encodec, PlaceholderEnCodec):
+                    encodec_failed = True
+                    if strict_components:
+                        raise RuntimeError(
+                            "EnCodec failed to load (got placeholder). "
+                            "Install with: pip install 'mlx-music[codecs]' "
+                            "or use strict_components=False to allow placeholder."
+                        )
+                    logger.warning("Audio decoding will use placeholder (silence)")
+                else:
+                    channels_str = "stereo" if audio_channels == 2 else "mono"
+                    logger.info(f"EnCodec loaded successfully! ({channels_str})")
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except RuntimeError:
+                # Re-raise RuntimeError from strict_components check
+                raise
             except Exception as e:
+                encodec_failed = True
+                if strict_components:
+                    raise RuntimeError(
+                        f"EnCodec failed to load: {e}. "
+                        "Use strict_components=False to allow placeholder."
+                    ) from e
                 logger.warning(f"Could not load EnCodec: {e}")
                 logger.warning("Audio decoding will use placeholder (silence)")
 
