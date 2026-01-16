@@ -154,6 +154,8 @@ class T5TextEncoder:
             for i, t in enumerate(text):
                 if not isinstance(t, str):
                     raise TypeError(f"text[{i}] must be a string, got {type(t).__name__}")
+                if not t.strip():
+                    raise ValueError(f"text[{i}] cannot be empty")
         else:
             raise TypeError(f"text must be str or list of str, got {type(text).__name__}")
 

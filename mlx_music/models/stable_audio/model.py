@@ -371,7 +371,11 @@ class StableAudio:
             )
 
         # Validate prompt
-        if not prompt or not prompt.strip():
+        if prompt is None:
+            raise ValueError("prompt cannot be None")
+        if not isinstance(prompt, str):
+            raise TypeError(f"prompt must be a string, got {type(prompt).__name__}")
+        if not prompt.strip():
             raise ValueError("prompt cannot be empty")
 
         # Set seed if provided

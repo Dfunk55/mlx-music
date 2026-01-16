@@ -139,8 +139,23 @@ class UMT5TextEncoder:
             - embeddings: Shape (batch, seq_len, 768)
             - attention_mask: Shape (batch, seq_len)
         """
+        # Validate text input
+        if text is None:
+            raise ValueError("text cannot be None")
         if isinstance(text, str):
+            if not text.strip():
+                raise ValueError("text cannot be empty")
             text = [text]
+        elif isinstance(text, list):
+            if len(text) == 0:
+                raise ValueError("text list cannot be empty")
+            for i, t in enumerate(text):
+                if not isinstance(t, str):
+                    raise TypeError(f"text[{i}] must be a string, got {type(t).__name__}")
+                if not t.strip():
+                    raise ValueError(f"text[{i}] cannot be empty")
+        else:
+            raise TypeError(f"text must be str or list of str, got {type(text).__name__}")
 
         max_length = max_length or self.config.max_length
 
