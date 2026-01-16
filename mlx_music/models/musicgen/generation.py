@@ -135,6 +135,10 @@ def sample_next_token(
     Returns:
         (batch, 1) sampled token indices
     """
+    # Validate temperature is non-negative
+    if temperature < 0:
+        raise ValueError(f"temperature must be non-negative, got {temperature}")
+
     # Greedy decoding: always take argmax
     if not use_sampling:
         next_token = mx.argmax(logits, axis=-1)
@@ -225,6 +229,18 @@ def blend_overlapping_audio(
     if overlap_samples <= 0:
         # No overlap, just concatenate
         return np.concatenate([prev_audio, curr_audio], axis=-1)
+
+    # Validate that audio segments have enough samples for the overlap
+    if prev_audio.shape[-1] < overlap_samples:
+        raise ValueError(
+            f"prev_audio has {prev_audio.shape[-1]} samples but overlap_samples={overlap_samples}. "
+            f"prev_audio must have at least {overlap_samples} samples."
+        )
+    if curr_audio.shape[-1] < overlap_samples:
+        raise ValueError(
+            f"curr_audio has {curr_audio.shape[-1]} samples but overlap_samples={overlap_samples}. "
+            f"curr_audio must have at least {overlap_samples} samples."
+        )
 
     # Ensure fade_samples doesn't exceed overlap
     fade_samples = min(fade_samples, overlap_samples)

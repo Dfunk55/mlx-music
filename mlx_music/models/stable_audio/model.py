@@ -364,11 +364,15 @@ class StableAudio:
                 f"num_inference_steps too large ({num_inference_steps}). Maximum is 1000."
             )
 
-        # Validate guidance_scale (must be positive, 1.0 = no CFG, >1.0 = standard CFG)
-        if guidance_scale <= 0:
+        # Validate guidance_scale (must be non-negative, 1.0 = no CFG, other values enable CFG)
+        if guidance_scale < 0:
             raise ValueError(
-                f"guidance_scale must be > 0, got {guidance_scale}"
+                f"guidance_scale must be >= 0, got {guidance_scale}"
             )
+
+        # Validate callback
+        if callback is not None and not callable(callback):
+            raise TypeError(f"callback must be callable, got {type(callback).__name__}")
 
         # Validate prompt
         if prompt is None:
@@ -417,8 +421,8 @@ class StableAudio:
                 global_embed=global_cond,
             )
 
-            # Classifier-free guidance
-            if guidance_scale > 1.0:
+            # Classifier-free guidance (skip only when guidance_scale == 1.0)
+            if guidance_scale != 1.0:
                 # Unconditional prediction
                 noise_pred_uncond = self.transformer(
                     hidden_states=latent_model_input,
