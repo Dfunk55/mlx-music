@@ -415,8 +415,6 @@ class StableAudio:
 
             # Classifier-free guidance
             if guidance_scale > 1.0:
-                mx.eval(noise_pred)
-
                 # Unconditional prediction
                 noise_pred_uncond = self.transformer(
                     hidden_states=latent_model_input,
@@ -424,13 +422,11 @@ class StableAudio:
                     encoder_hidden_states=neg_text_embeds,
                     global_embed=neg_global_cond,
                 )
-                mx.eval(noise_pred_uncond)
 
                 # CFG combination
                 noise_pred = noise_pred_uncond + guidance_scale * (
                     noise_pred - noise_pred_uncond
                 )
-                mx.eval(noise_pred)
 
             # Scheduler step
             output = self.scheduler.step(noise_pred, t, latents)
@@ -440,7 +436,7 @@ class StableAudio:
             if callback is not None:
                 callback(i, t, latents)
 
-            # Evaluate for progress
+            # Single batched evaluation at end of iteration for better performance
             mx.eval(latents)
 
         # Decode to audio

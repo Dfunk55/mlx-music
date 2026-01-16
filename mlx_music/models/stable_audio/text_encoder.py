@@ -302,7 +302,11 @@ def get_text_encoder(
             return T5TextEncoder.from_pretrained(
                 model_path, device=device, use_fp16=use_fp16
             )
-        except Exception as e:
+        except (KeyboardInterrupt, SystemExit):
+            # Don't catch user interrupts or system exits
+            raise
+        except (OSError, RuntimeError, ValueError, ImportError) as e:
+            # Only catch expected errors during model loading
             logger.warning(f"Could not load T5 encoder: {e}")
             logger.warning("Using placeholder encoder (text will not condition generation)")
             return PlaceholderTextEncoder()

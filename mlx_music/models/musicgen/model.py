@@ -220,8 +220,12 @@ class MusicGen:
         # Automatically route to extended generation for duration > 30s
         max_duration = 30.0  # MusicGen default max
         if duration > max_duration:
-            import logging
-            logger = logging.getLogger(__name__)
+            # Warn about batch limitation
+            if isinstance(prompt, list) and len(prompt) > 1:
+                logger.warning(
+                    f"Batch generation not supported for duration > {max_duration}s. "
+                    f"Using only the first prompt (discarding {len(prompt) - 1} prompts)."
+                )
             logger.info(
                 f"Duration {duration}s exceeds {max_duration}s limit. "
                 "Automatically using generate_extended() for seamless long-form audio."

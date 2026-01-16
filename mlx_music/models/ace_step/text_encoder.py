@@ -216,9 +216,9 @@ class PlaceholderTextEncoder:
         else:
             batch_size = len(text)
 
-        # Create placeholder embeddings (not useful for generation)
-        embeddings = mx.zeros((batch_size, 64, self.hidden_size))
-        attention_mask = mx.ones((batch_size, 64))
+        # Create placeholder embeddings with correct shape (not useful for generation)
+        embeddings = mx.zeros((batch_size, max_length, self.hidden_size))
+        attention_mask = mx.ones((batch_size, max_length))
 
         return embeddings, attention_mask
 

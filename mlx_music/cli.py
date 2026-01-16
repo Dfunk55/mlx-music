@@ -42,7 +42,46 @@ def detect_model_family(model_path: str) -> str:
     return "ace-step"
 
 
-def main():
+def validate_args(args) -> None:
+    """
+    Validate CLI arguments before processing.
+
+    Args:
+        args: Parsed command-line arguments
+
+    Raises:
+        SystemExit: If validation fails
+    """
+    # Validate duration
+    if args.duration <= 0:
+        logger.error(f"Duration must be positive, got {args.duration}")
+        sys.exit(1)
+
+    # Validate steps if provided
+    if args.steps is not None and args.steps <= 0:
+        logger.error(f"Steps must be positive, got {args.steps}")
+        sys.exit(1)
+
+    # Validate guidance if provided
+    if args.guidance is not None and args.guidance < 0:
+        logger.error(f"Guidance scale must be non-negative, got {args.guidance}")
+        sys.exit(1)
+
+
+def ensure_output_directory(output_path: str) -> None:
+    """
+    Ensure the output directory exists.
+
+    Args:
+        output_path: Path to the output file
+    """
+    output_dir = Path(output_path).parent
+    if output_dir and not output_dir.exists():
+        logger.info(f"Creating output directory: {output_dir}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def main() -> None:
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
         description="MLX Music - Generate music on Apple Silicon",
@@ -162,37 +201,61 @@ Examples:
         generate_command(args)
 
 
-def generate_command(args):
+def generate_command(args) -> None:
     """Handle generate command."""
-    from tqdm import tqdm
-
     from mlx_music.utils.audio_io import save_audio
+
+    # Validate arguments
+    validate_args(args)
 
     # Auto-detect model family if not specified
     engine = args.engine or detect_model_family(args.model)
 
+    # Warn about incompatible parameter combinations
+    if args.lyrics and engine != "ace-step":
+        logger.warning(f"--lyrics is only supported for ACE-Step. Ignoring for {engine}.")
+
+    if args.negative_prompt and engine != "stable-audio":
+        logger.warning(f"--negative-prompt is only supported for Stable Audio. Ignoring for {engine}.")
+
+    # Ensure output directory exists
+    ensure_output_directory(args.output)
+
     logger.info(f"Using engine: {engine}")
     logger.info(f"Loading model: {args.model}")
 
-    if engine == "ace-step":
-        _generate_ace_step(args)
-    elif engine == "musicgen":
-        _generate_musicgen(args)
-    elif engine == "stable-audio":
-        _generate_stable_audio(args)
-    else:
-        logger.error(f"Unknown engine: {engine}")
+    try:
+        if engine == "ace-step":
+            _generate_ace_step(args)
+        elif engine == "musicgen":
+            _generate_musicgen(args)
+        elif engine == "stable-audio":
+            _generate_stable_audio(args)
+        else:
+            logger.error(f"Unknown engine: {engine}")
+            sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("\nGeneration cancelled by user.")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Generation failed: {e}")
+        if hasattr(args, "verbose") and args.verbose:
+            import traceback
+            traceback.print_exc()
         sys.exit(1)
 
 
-def _generate_ace_step(args):
+def _generate_ace_step(args) -> None:
     """Generate music using ACE-Step."""
     from tqdm import tqdm
 
     from mlx_music import ACEStep
     from mlx_music.utils.audio_io import save_audio
 
-    model = ACEStep.from_pretrained(args.model)
+    try:
+        model = ACEStep.from_pretrained(args.model)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load ACE-Step model from '{args.model}': {e}") from e
 
     logger.info(f"Generating {args.duration}s of music...")
     logger.info(f"  Prompt: {args.prompt}")
@@ -203,24 +266,25 @@ def _generate_ace_step(args):
     steps = args.steps or 60
     guidance = args.guidance or 15.0
 
-    # Progress callback
+    # Progress callback with try/finally for cleanup
     pbar = tqdm(total=steps, desc="Generating")
 
     def callback(step, timestep, latents):
         pbar.update(1)
 
-    output = model.generate(
-        prompt=args.prompt,
-        lyrics=args.lyrics,
-        duration=args.duration,
-        num_inference_steps=steps,
-        guidance_scale=guidance,
-        seed=args.seed,
-        scheduler_type=args.scheduler,
-        callback=callback,
-    )
-
-    pbar.close()
+    try:
+        output = model.generate(
+            prompt=args.prompt,
+            lyrics=args.lyrics,
+            duration=args.duration,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            seed=args.seed,
+            scheduler_type=args.scheduler,
+            callback=callback,
+        )
+    finally:
+        pbar.close()
 
     # Save output
     save_audio(output.audio, args.output, output.sample_rate)
@@ -228,14 +292,17 @@ def _generate_ace_step(args):
     logger.info(f"Saved to: {args.output}")
 
 
-def _generate_musicgen(args):
+def _generate_musicgen(args) -> None:
     """Generate music using MusicGen."""
     from tqdm import tqdm
 
     from mlx_music import MusicGen
     from mlx_music.utils.audio_io import save_audio
 
-    model = MusicGen.from_pretrained(args.model)
+    try:
+        model = MusicGen.from_pretrained(args.model)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load MusicGen model from '{args.model}': {e}") from e
 
     logger.info(f"Generating {args.duration}s of music...")
     logger.info(f"  Prompt: {args.prompt}")
@@ -256,6 +323,8 @@ def _generate_musicgen(args):
     else:
         # Calculate steps based on duration and frame rate
         frame_rate = model.config.frame_rate
+        if frame_rate <= 0:
+            raise ValueError(f"Invalid frame_rate in model config: {frame_rate}")
         total_steps = int(args.duration * frame_rate)
 
         pbar = tqdm(total=total_steps, desc="Generating")
@@ -264,14 +333,16 @@ def _generate_musicgen(args):
             pbar.n = step
             pbar.refresh()
 
-        output = model.generate(
-            prompt=args.prompt,
-            duration=args.duration,
-            guidance_scale=guidance,
-            seed=args.seed,
-            callback=callback,
-        )
-        pbar.close()
+        try:
+            output = model.generate(
+                prompt=args.prompt,
+                duration=args.duration,
+                guidance_scale=guidance,
+                seed=args.seed,
+                callback=callback,
+            )
+        finally:
+            pbar.close()
 
     # Save output
     save_audio(output.audio, args.output, output.sample_rate)
@@ -279,14 +350,17 @@ def _generate_musicgen(args):
     logger.info(f"Saved to: {args.output}")
 
 
-def _generate_stable_audio(args):
+def _generate_stable_audio(args) -> None:
     """Generate music using Stable Audio."""
     from tqdm import tqdm
 
     from mlx_music import StableAudio
     from mlx_music.utils.audio_io import save_audio
 
-    model = StableAudio.from_pretrained(args.model)
+    try:
+        model = StableAudio.from_pretrained(args.model)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load Stable Audio model from '{args.model}': {e}") from e
 
     logger.info(f"Generating {args.duration}s of music...")
     logger.info(f"  Prompt: {args.prompt}")
@@ -297,23 +371,24 @@ def _generate_stable_audio(args):
     steps = args.steps or 100
     guidance = args.guidance or 7.0
 
-    # Progress callback
+    # Progress callback with try/finally for cleanup
     pbar = tqdm(total=steps, desc="Generating")
 
     def callback(step, timestep, latents):
         pbar.update(1)
 
-    output = model.generate(
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        duration=args.duration,
-        num_inference_steps=steps,
-        guidance_scale=guidance,
-        seed=args.seed,
-        callback=callback,
-    )
-
-    pbar.close()
+    try:
+        output = model.generate(
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            duration=args.duration,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            seed=args.seed,
+            callback=callback,
+        )
+    finally:
+        pbar.close()
 
     # Save output
     save_audio(output.audio, args.output, output.sample_rate)
