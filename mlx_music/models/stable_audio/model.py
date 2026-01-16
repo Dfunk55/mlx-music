@@ -364,10 +364,10 @@ class StableAudio:
                 f"num_inference_steps too large ({num_inference_steps}). Maximum is 1000."
             )
 
-        # Validate guidance_scale
-        if guidance_scale < 1.0:
+        # Validate guidance_scale (must be positive, 1.0 = no CFG, >1.0 = standard CFG)
+        if guidance_scale <= 0:
             raise ValueError(
-                f"guidance_scale must be >= 1.0, got {guidance_scale}"
+                f"guidance_scale must be > 0, got {guidance_scale}"
             )
 
         # Validate prompt

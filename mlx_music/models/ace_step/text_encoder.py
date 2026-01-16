@@ -262,7 +262,11 @@ def get_text_encoder(
             return UMT5TextEncoder.from_pretrained(
                 model_path, device=device, use_fp16=use_fp16
             )
-        except Exception as e:
+        except (KeyboardInterrupt, SystemExit):
+            # Don't catch user interrupts or system exits
+            raise
+        except (OSError, RuntimeError, ValueError, ImportError) as e:
+            # Only catch expected errors during model loading
             logger.warning(f"Could not load UMT5 encoder: {e}")
             logger.warning("Using placeholder encoder (generation will not work properly)")
             return PlaceholderTextEncoder()

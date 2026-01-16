@@ -52,9 +52,16 @@ def validate_args(args) -> None:
     Raises:
         SystemExit: If validation fails
     """
+    # Maximum duration to prevent resource exhaustion (10 minutes)
+    MAX_DURATION = 600.0
+
     # Validate duration
     if args.duration <= 0:
         logger.error(f"Duration must be positive, got {args.duration}")
+        sys.exit(1)
+
+    if args.duration > MAX_DURATION:
+        logger.error(f"Duration must be <= {MAX_DURATION}s, got {args.duration}")
         sys.exit(1)
 
     # Validate steps if provided
@@ -63,8 +70,8 @@ def validate_args(args) -> None:
         sys.exit(1)
 
     # Validate guidance if provided
-    if args.guidance is not None and args.guidance < 0:
-        logger.error(f"Guidance scale must be non-negative, got {args.guidance}")
+    if args.guidance is not None and args.guidance <= 0:
+        logger.error(f"Guidance scale must be positive, got {args.guidance}")
         sys.exit(1)
 
 

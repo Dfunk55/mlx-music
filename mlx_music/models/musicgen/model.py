@@ -209,6 +209,21 @@ class MusicGen:
         Returns:
             GenerationOutput (single) or List[GenerationOutput] (batch)
         """
+        # Validate prompt
+        if prompt is None:
+            raise ValueError("prompt cannot be None")
+        if isinstance(prompt, str):
+            if not prompt.strip():
+                raise ValueError("prompt cannot be empty")
+        elif isinstance(prompt, list):
+            if len(prompt) == 0:
+                raise ValueError("prompt list cannot be empty")
+            for i, p in enumerate(prompt):
+                if not isinstance(p, str) or not p.strip():
+                    raise ValueError(f"prompt[{i}] must be a non-empty string")
+        else:
+            raise TypeError(f"prompt must be str or list of str, got {type(prompt).__name__}")
+
         if self.text_encoder is None:
             raise RuntimeError(
                 "Text encoder not loaded. Load with load_text_encoder=True"
@@ -231,7 +246,7 @@ class MusicGen:
                 "Automatically using generate_extended() for seamless long-form audio."
             )
             return self.generate_extended(
-                prompt=prompt if isinstance(prompt, str) else prompt[0],
+                prompt=prompt[0] if isinstance(prompt, list) else prompt,
                 duration=duration,
                 temperature=temperature,
                 top_k=top_k,

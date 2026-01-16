@@ -141,8 +141,21 @@ class T5TextEncoder:
             - text_embeds: Shape (batch, seq_len, hidden_size)
             - pooled_embeds: Shape (batch, hidden_size) - mean pooled
         """
+        # Validate text input
+        if text is None:
+            raise ValueError("text cannot be None")
         if isinstance(text, str):
+            if not text.strip():
+                raise ValueError("text cannot be empty")
             text = [text]
+        elif isinstance(text, list):
+            if len(text) == 0:
+                raise ValueError("text list cannot be empty")
+            for i, t in enumerate(text):
+                if not isinstance(t, str):
+                    raise TypeError(f"text[{i}] must be a string, got {type(t).__name__}")
+        else:
+            raise TypeError(f"text must be str or list of str, got {type(text).__name__}")
 
         max_length = max_length or self.config.max_length
 
