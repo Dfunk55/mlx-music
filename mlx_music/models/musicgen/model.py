@@ -4,6 +4,7 @@ MusicGen main model class.
 High-level interface for loading and generating music with MusicGen.
 """
 
+import logging
 from pathlib import Path
 from typing import Callable, List, Optional, Union
 
@@ -14,6 +15,8 @@ from .config import MusicGenConfig
 from .conditioning import MelodyConditioner, get_text_encoder
 from .generation import GenerationOutput, MusicGenGenerator
 from .transformer import MusicGenDecoder, load_musicgen_decoder_weights
+
+logger = logging.getLogger(__name__)
 
 
 class MusicGen:
@@ -32,6 +35,9 @@ class MusicGen:
         >>> import soundfile as sf
         >>> sf.write("output.wav", output.audio.T, output.sample_rate)
     """
+
+    # Maximum duration for single generation (use generate_extended for longer)
+    MAX_DURATION = 30.0
 
     def __init__(
         self,
@@ -106,36 +112,36 @@ class MusicGen:
         model_path = download_model(str(model_path))
 
         # Load config
-        print("Loading configuration...")
+        logger.info("Loading configuration...")
         config = MusicGenConfig.from_pretrained(model_path)
 
         # Create and load decoder
-        print(f"Loading decoder ({config.decoder.num_hidden_layers} layers)...")
+        logger.info(f"Loading decoder ({config.decoder.num_hidden_layers} layers)...")
         decoder = MusicGenDecoder(config.decoder)
         weights = load_musicgen_decoder_weights(model_path, dtype)
 
         # Map weights to model parameters
         decoder.load_weights(list(weights.items()), strict=False)
-        print(f"Decoder loaded: {config.decoder.hidden_size}d, {config.decoder.num_attention_heads} heads")
+        logger.info(f"Decoder loaded: {config.decoder.hidden_size}d, {config.decoder.num_attention_heads} heads")
 
         # Load text encoder
         text_encoder = None
         if load_text_encoder:
-            print("Loading text encoder (T5)...")
+            logger.info("Loading text encoder (T5)...")
             try:
                 text_encoder = get_text_encoder(
                     model_path=model_path,
                     use_fp16=(dtype == mx.float16),
                 )
-                print("Text encoder loaded successfully!")
+                logger.info("Text encoder loaded successfully!")
             except Exception as e:
-                print(f"Warning: Could not load text encoder: {e}")
-                print("Using placeholder encoder (generation will have limited quality)")
+                logger.warning(f"Could not load text encoder: {e}")
+                logger.warning("Using placeholder encoder (generation will have limited quality)")
 
         # Load EnCodec
         encodec = None
         if load_encodec:
-            print("Loading EnCodec audio codec...")
+            logger.info("Loading EnCodec audio codec...")
             try:
                 from mlx_music.codecs import get_encodec
 
@@ -148,10 +154,10 @@ class MusicGen:
                     audio_channels=audio_channels,
                 )
                 channels_str = "stereo" if audio_channels == 2 else "mono"
-                print(f"EnCodec loaded successfully! ({channels_str})")
+                logger.info(f"EnCodec loaded successfully! ({channels_str})")
             except Exception as e:
-                print(f"Warning: Could not load EnCodec: {e}")
-                print("Audio decoding will use placeholder (silence)")
+                logger.warning(f"Could not load EnCodec: {e}")
+                logger.warning("Audio decoding will use placeholder (silence)")
 
         # Load melody conditioner for melody variant
         melody_conditioner = None
@@ -162,7 +168,7 @@ class MusicGen:
                 hidden_size=config.hidden_size,
                 frame_rate=config.frame_rate,
             )
-            print("Melody conditioner initialized")
+            logger.info("Melody conditioner initialized")
 
         return cls(
             decoder=decoder,
@@ -206,20 +212,56 @@ class MusicGen:
         Returns:
             GenerationOutput (single) or List[GenerationOutput] (batch)
         """
+        # Validate prompt
+        if prompt is None:
+            raise ValueError("prompt cannot be None")
+        if isinstance(prompt, str):
+            if not prompt.strip():
+                raise ValueError("prompt cannot be empty")
+        elif isinstance(prompt, list):
+            if len(prompt) == 0:
+                raise ValueError("prompt list cannot be empty")
+            for i, p in enumerate(prompt):
+                if not isinstance(p, str) or not p.strip():
+                    raise ValueError(f"prompt[{i}] must be a non-empty string")
+        else:
+            raise TypeError(f"prompt must be str or list of str, got {type(prompt).__name__}")
+
         if self.text_encoder is None:
             raise RuntimeError(
-                "Text encoder not loaded. Load with load_text_encoder=True"
+                "Text encoder not available. Reload model with "
+                "MusicGen.from_pretrained(..., load_text_encoder=True)"
             )
 
         if self.encodec is None:
-            raise RuntimeError("EnCodec not loaded. Load with load_encodec=True")
+            raise RuntimeError(
+                "EnCodec not available. Reload model with "
+                "MusicGen.from_pretrained(..., load_encodec=True)"
+            )
 
-        # Validate duration
-        max_duration = 30.0  # MusicGen default max
-        if duration > max_duration:
-            print(
-                f"Warning: Duration {duration}s exceeds recommended max {max_duration}s. "
-                "Generation may be slow or fail."
+        # Automatically route to extended generation for duration > MAX_DURATION
+        if duration > self.MAX_DURATION:
+            # Warn about batch limitation - extended generation requires sequential context
+            if isinstance(prompt, list) and len(prompt) > 1:
+                logger.warning(
+                    f"Extended generation (>{self.MAX_DURATION}s) requires sequential context "
+                    f"and doesn't support batch processing. Using only the first prompt "
+                    f"(discarding {len(prompt) - 1} prompts)."
+                )
+            logger.info(
+                f"Duration {duration}s exceeds {self.MAX_DURATION}s limit. "
+                "Automatically using generate_extended() for seamless long-form audio."
+            )
+            return self.generate_extended(
+                prompt=prompt[0] if isinstance(prompt, list) else prompt,
+                duration=duration,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                guidance_scale=guidance_scale,
+                use_sampling=use_sampling,
+                seed=seed,
+                callback=callback,
             )
 
         return self.generator.generate(
